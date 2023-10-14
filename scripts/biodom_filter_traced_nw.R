@@ -76,8 +76,6 @@ if( directed ){
 
 # filter traced NW ----------------------------------------------------------
 
-cat('Filter traced NW for nodes annotated to biodomain. \n')
-
 # read nw
 trace.nw <- igraph::read_graph(
   paste0( full_path, '/',
@@ -85,29 +83,42 @@ trace.nw <- igraph::read_graph(
           '.graphml')
   , format = 'graphml') 
 
-dom = working_path %>% str_replace_all(.,'_',' ')
+# names of genes in traced network
+trace_nw_genes <- names(igraph::V(trace.nw))
 
-# Filter NW obj for traced nodes **annotated to biodomain**
+# ID target biodomain from path name
+dom = full_path %>% 
+  str_split('\\/') %>% 
+  unlist() %>% 
+  str_replace_all(., '_',' ') %>% 
+  str_subset(., paste0(domains, collapse = '|'))
+
+cat('Filter traced NW for nodes annotated to biodomain: ', dom, '\n')
+
+# list genes **annotated to biodomain**
 bd_genes <- biodom %>% 
-  filter(Biodomain == dom) %>%
+  filter(Biodomain == dom,
+         GO_ID != 'GO:0043227' # membrane-bound organelle w/ 12k genes annotated
+         ) %>%
   pull(symbol) %>% 
   unlist() %>% 
   unique() %>% 
   .[!is.na(.)]
 
-trace_nw_genes <- names(igraph::V(trace.nw))
-trace_nw_filter <- intersect(trace_nw_genes, bd_genes)
+# genes not in target biodomain
+trace_nw_filter <- setdiff(trace_nw_genes, bd_genes)
 
-trace.nw.bdFilt <- igraph::induced_subgraph(
+# remove vert not in biodom
+trace.nw.bdFilt <- igraph::delete_vertices(
   trace.nw,
   v=igraph::V(trace.nw)[ names(igraph::V(trace.nw)) %in% trace_nw_filter ]
-)
+) # PREVIOUS: igraph::induced_subgraph( trace.nw, v )
 
 # write filtered nw
 igraph::write_graph(
   trace.nw.bdFilt,
   paste0( full_path, '/',
-          'bdFiltered_', working_path,directionality, filt,
+          'bdFiltered_', working_path, directionality, filt,
           '.graphml'),
   format = "graphml"
 )

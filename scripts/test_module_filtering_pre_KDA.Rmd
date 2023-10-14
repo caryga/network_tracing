@@ -1,0 +1,621 @@
+---
+title: "Test module filter for KDA"
+author: "Greg Cary"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    fig_width: 5
+    fig_height: 4
+  html_notebook:
+    code_folding: hide
+    theme: readable
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+The GO terms within a given biodomain network may have different representation. The purpose of this work is to determine if KDA run with a pre-filtered GO term set yields dramatically different results.  
+
+# setup
+## packages
+```{r setup}
+# # Package names
+# packages <- c(
+#   # 'paxtoolsr','org.Hs.eg.db','HotNetvieweR','clusterProfiler', 
+#   'synapser','igraph','tidygraph','ggraph','tidyverse'
+#   )
+# 
+# # Load packages
+# invisible(lapply(packages, library, character.only = TRUE))
+
+library(synapser)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(tidyverse)
+
+source(paste0(here::here(),'/../treatAD_biodomains/scripts/biodom_tally.R'))
+source(paste0(here::here(),'/../treatAD_biodomains/scripts/annotate_enr_term_biodomains.R'))
+source(paste0(here::here(),'/../treatAD_biodomains/scripts/biodom_enr_plots.R'))
+
+# source Mergeomics
+source('https://raw.githubusercontent.com/jessicading/mergeomics/master/Mergeomics_Version_1.99.0.R')
+
+theme_set(theme_bw())
+```
+
+## data
+```{r}
+synLogin()
+
+# target risk scores
+scores <- read_csv(
+  synTableQuery('select * from syn25575156', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+omics <- read_csv(
+  synTableQuery('select * from syn22758536', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+# biological domain annotations
+biodom <- full_join(
+  # biodomains
+  readRDS(synGet('syn25428992')$path),
+  # domain labels
+  read_csv(synGet('syn26856828')$path, col_types = cols()),
+  by = c('Biodomain'='domain')
+) %>%
+  mutate(Biodomain = case_when(Biodomain == 'none' ~ NA_character_, T ~ Biodomain))
+
+domains = biodom %>% pull(Biodomain) %>% unique() %>% sort()
+
+# enriched biodomain terms
+enr.bd <- read_csv( synGet('syn45824995')$path, col_types = cols() ) %>% 
+  mutate(leadingEdge_genes = str_split(leadingEdge_genes, '\\|'))
+
+# base network
+base_net <- igraph::read_graph(synGet('syn51110930')$path, format = 'graphml') 
+
+# filt node & edge
+tmp <- igraph::delete_vertices(
+  base_net,
+  igraph::V(base_net)[ igraph::V(base_net)$brain_exp == 0 ]
+)
+undir_node_edge <- igraph::subgraph.edges(
+  tmp,
+  igraph::E(tmp)[ igraph::E(tmp)$n_edge_evidence > 1 ],
+  delete.vertices = T 
+)
+
+# specify directed edge types
+directed_edge_types = c("catalysis-precedes",
+                        "controls-expression-of",
+                        "controls-phosphorylation-of",
+                        "controls-state-change-of",
+                        "controls-transport-of"
+                        )
+
+# top level biodom directory
+doms <- synGetChildren('syn51739831')$asList() %>%
+  tibble(f = .) %>% unnest_wider(f) %>%
+  filter( !(name %in% 
+              c('pseudotime',
+                'nanostring_induced_subgraph.graphml', 
+                'key_drivers_all_nw.csv',
+                'module_representation_across_networks.tsv',
+                'network_stats_dataframe.rds')) ) %>%
+  select(bd = name, id) %>% 
+  arrange(bd) %>% 
+  mutate(i = 1:nrow(.)) %>% 
+  rowwise() %>% 
+  mutate(
+    nw.dir = synGetChildren(  parent = id  )$asList() %>% 
+      tibble(f = .) %>% unnest_wider(f) %>% list(),
+    kd.dir = synGetChildren(  parent = nw.dir$id[grepl('kda',nw.dir$name)]  )$asList() %>% 
+      tibble(f = .) %>% unnest_wider(f) %>% list()
+    )
+
+```
+
+## functions
+read KDA result data  
+```{r}
+# remote from synase
+read_kd_remote <- function(kda_dir_syn_id){
+  
+  synDir <- synGetChildren(kda_dir_syn_id)$asList() %>%
+  tibble(f = .) %>% unnest_wider(f)
+  
+  
+  kd.ef0 <- read_tsv(
+    synGet( 
+      synDir %>% filter( grepl('edgeFactor_0.results.txt', name) ) %>% pull(id)
+      )$path, 
+    col_types = cols())
+  kd.ef1 <- read_tsv(
+    synGet( 
+      synDir %>% filter( grepl('edgeFactor_1.results.txt', name) ) %>% pull(id)
+      )$path, 
+    col_types = cols())
+  kd.top <- read_tsv(
+    synGet( 
+      synDir %>% filter( grepl('edgeFactor_1.tophits.txt', name) ) %>% pull(id)
+      )$path, 
+    col_types = cols()) %>% 
+    mutate(kd = paste0(NODE,'-',MODULE))
+    
+  kd = bind_rows(
+    kd.ef0 %>% mutate(ef = 'ef0_fdr'),
+    kd.ef1 %>% mutate(ef = 'ef1_fdr')
+    ) %>% 
+    mutate(FDR = -log10(FDR)) %>%
+    pivot_wider(id_cols = c(MODULE, NODE, MEMBER), 
+                names_from = ef, values_from = FDR, values_fill = 0) %>%
+    mutate(delta_fdr = ef1_fdr - ef0_fdr) %>% arrange(desc(delta_fdr)) %>% 
+    mutate(top = 0)
+  
+  if( any( kd.top$FDR < 0.05 ) ){
+    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% kd.top$kd[kd.top$FDR < 0.05]) ] <- 1
+  }
+  
+  return(kd)
+}
+
+# local directory
+read_kd_local <- function(local_path){
+  
+  kd.pth <- list.files(local_path, full.names = T)
+  
+  kd.ef0 <- read_tsv(
+    kd.pth %>% str_subset('_0.results.txt'), 
+    col_types = cols())
+  kd.ef1 <- read_tsv(
+    kd.pth %>% str_subset('_1.results.txt'),  
+    col_types = cols())
+  kd.top <- read_tsv(
+    kd.pth %>% str_subset('_1.tophits.txt'), 
+    col_types = cols()) %>% 
+    mutate(kd = paste0(NODE,'-',MODULE))
+    
+  kd = bind_rows(
+    kd.ef0 %>% mutate(ef = 'ef0_fdr'),
+    kd.ef1 %>% mutate(ef = 'ef1_fdr')
+    ) %>% 
+    mutate(FDR = -log10(FDR)) %>%
+    pivot_wider(id_cols = c(MODULE, NODE, MEMBER), 
+                names_from = ef, values_from = FDR, values_fill = 0) %>%
+    mutate(delta_fdr = ef1_fdr - ef0_fdr) %>% arrange(desc(delta_fdr)) %>% 
+    mutate(top = 0)
+  
+  if( any( kd.top$FDR < 0.05 ) ){
+    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% kd.top$kd[kd.top$FDR < 0.05]) ] <- 1
+  }
+  
+  return(kd)
+}
+
+```
+
+Network properties 
+```{r}
+v_info <- function(net){
+  v.attr <- tibble( na = vertex.attributes(net) ) %>%
+    t() %>% 
+    as_tibble(rownames = NA, .name_repair = 'unique') %>% 
+    unnest(everything()) %>%
+    rename_with(., ~names(vertex.attributes(net)), everything())
+}
+
+e_info <- function(net){
+  e.attr <- tibble( ea = edge.attributes(net) ) %>% 
+    t() %>% 
+    as_tibble(rownames = NA, .name_repair = 'unique') %>% 
+    unnest(everything()) %>% 
+    rename_with(., ~names(edge.attributes(net)), everything())
+}
+```
+
+
+plot subnetwork around identified KDs  
+```{r}
+plot_kd_subnet <- function(nw, kd, term) {
+  
+  vert_num <- match(kd, V(nw)$name)
+  
+  vert_neigh <- neighbors(nw, vert_num)
+  
+  term_num <- biodom %>%
+    filter(GOterm_Name == term) %>%
+    pull(symbol) %>% unlist() %>%
+    match(., V(nw)$name) %>% .[!is.na(.)]
+  
+  g2 <- induced_subgraph(nw, c(vert_num, intersect(term_num, vert_neigh)))
+  g3 <- induced_subgraph(nw, c(vert_num, term_num))
+  
+  cowplot::plot_grid(
+    
+    ggraph(g3, layout = 'linear', circular = TRUE) +
+      geom_edge_arc(alpha = .3, color = 'grey75') +
+      geom_node_point( shape = 21, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter= .N()$name != kd)  )+
+      geom_node_point( shape = 23, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter = .N()$name == kd) )+
+      geom_node_text(aes(label = name), size = 2) +
+      coord_fixed() +
+      scale_size_continuous( range = c(.5, 10), limits = c(0, 5), trans = 'exp')+
+      scale_fill_gradient2(
+        low = 'purple', mid = 'grey20', high = 'green', na.value = 'grey85',
+        limits = c(-2.5,2.5) )+ #approx: range(omics$Pro_TE, na.rm = T)
+      labs( title = 'All term genes in NW',
+            subtitle = paste0('KD: ', kd, '\nTerm: ', term) )+
+      theme_graph(background = 'white')
+    ,
+    ggraph(g2, layout = 'linear', circular = TRUE) +
+            geom_edge_arc(alpha = .3, color = 'grey75') +
+      geom_node_point( shape = 21, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter= .N()$name != kd)  )+
+      geom_node_point( shape = 23, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter = .N()$name == kd) )+
+      geom_node_text(aes(label = name), size = 2) +
+      coord_fixed() +
+      scale_size_continuous( range = c(.5, 10), limits = c(0, 5), trans = 'exp')+
+      scale_fill_gradient2(
+        low = 'purple', mid = 'grey20', high = 'green', na.value = 'grey85',
+        limits = c(-2.5,2.5) )+ #approx: range(omics$Pro_TE, na.rm = T)
+      labs( title = 'Term genes & KD neighbors in NW',
+            subtitle = paste0('KD: ', kd, '\nTerm: ', term) )+
+      theme_graph(background = 'white')
+    ,
+    ncol = 2
+    
+  )
+}
+```
+
+# set up kda
+
+<!-- # start a directory -->
+<!-- if( !(dir.exists( paste0(full_path,'/kda') )) ){ -->
+<!--   dir.create( paste0(full_path,'/kda') ) -->
+<!-- } -->
+
+read graph from synapse  
+```{r}
+
+# read traced, filtered NW objects
+trace.nw.bdFilt <- doms %>% 
+  filter(bd == 'Endolysosome') %>% 
+  pull(nw.dir) %>% .[[1]] %>% 
+  filter(grepl('bdFilt', name)) %>% 
+  pull(id) %>% synGet(.) %>% .$path %>% 
+  igraph::read_graph(., format = "graphml")
+
+# Remove redundant edges
+nw.simple <- igraph::simplify(
+  trace.nw.bdFilt,
+  remove.multiple = TRUE,
+  remove.loops = FALSE,
+  edge.attr.comb = list( 
+    interaction = 'concat',
+    edge = 'random',
+    occurrance = 'concat',
+    n_edge = 'max',
+    n_edge_types = 'max',
+    n_edge_evidence = 'max',
+    n_source = 'max',
+    sources = 'concat',
+    n_evidence = 'sum',
+    evidence_pmid = 'concat',
+    n_pathways = 'max',
+    pathway_names = 'concat',
+    directed = 'max'
+  )
+)
+
+# Add TREAT-AD scores to edge attributes
+kda.nw <- tibble( ea = edge.attributes(nw.simple) ) %>% 
+  t() %>% as_tibble(rownames = NA, .name_repair = 'unique') %>% 
+  unnest(everything()) %>% 
+  rename_with(., ~names(edge.attributes(nw.simple)), everything()) %>% 
+  select(edge, interaction, occurrance, directed, n_edge, 
+         n_edge_evidence, n_source, n_edge_types) %>% 
+  mutate(HEAD = str_split_fixed(edge, ':',2)[,1], 
+         TAIL = str_split_fixed(edge, ':',2)[,2]) %>% 
+  relocate(HEAD, TAIL) %>% select(-edge) %>% 
+  left_join(., 
+            scores %>% 
+              select(HEAD = GeneName, h.c = Overall, h.g = GeneticsScore, 
+                     h.o = OmicsScore, h.n = NeuropathScore),
+            by = 'HEAD') %>% 
+  left_join(., 
+            scores %>% 
+              select(TAIL = GeneName, t.c = Overall, t.g = GeneticsScore, 
+                     t.o = OmicsScore, t.n = NeuropathScore),
+            by = 'TAIL')
+
+```
+
+Network file   
+```{r}
+##
+# generate network file
+nw.file <- kda.nw %>% 
+  mutate(
+    across(.cols = c(starts_with('h.'), starts_with('t.')), 
+           ~ if_else(is.na(.x), 0, .x)),
+    WEIGHT = h.c+t.c
+  ) %>%
+  select(HEAD, TAIL, WEIGHT) %>% 
+  distinct() 
+```
+
+Module files, and calculate the percent of each GO term's genes that are present within the network.    
+```{r}
+##
+# Module file
+mod.file <- biodom %>% 
+  filter(!is.na(n_symbol),
+         n_symbol > 0
+         # , Biodomain == dom
+  ) %>% 
+  select(Biodomain, MODULE = GOterm_Name, NODE = symbol, n_symbol) %>% 
+  rowwise() %>% 
+  mutate(
+    n_nw = length( intersect( NODE, names(V(nw.simple)) ) ),
+    pct_term = 100*(n_nw/n_symbol)
+  ) %>% 
+  unnest_longer(NODE) %>% 
+  filter(NODE != '') %>% 
+  distinct() 
+
+##
+# Module file from filtered base NW
+mod.file.filt.base <- biodom %>% 
+    filter(!is.na(n_symbol),
+           n_symbol > 0
+           # , Biodomain == dom
+    ) %>% 
+    select(Biodomain, MODULE = GOterm_Name, NODE = symbol, n_symbol) %>% 
+    rowwise() %>% 
+    mutate(
+        n_nw = length( intersect( NODE, names(V(undir_node_edge)) ) ),
+        pct_term = 100*(n_nw/n_symbol)
+    ) %>% 
+    distinct() 
+
+```
+
+Considering the Pathway Commons network filtered for brain expression (nodes) and literature support (edges), yields a distribution of biodomain GO term representations where most terms have >50% of genes from the term in the network.  
+```{r}
+mod.file.filt.base %>% 
+  filter(pct_term > 0, n_nw >= 3) %>% 
+  select(Biodomain, MODULE, pct_term) %>% 
+  distinct() %>% 
+  ggplot(aes(pct_term))+
+  geom_histogram(color = 'grey20', fill = 'grey80', bins = 25)+
+  labs(x = '% GO term genes in NW', 
+       subtitle = 'distribution of all terms >0% and >=3 genes in filtered base NW')
+# +
+#   facet_wrap(~Biodomain, scales = 'free_y')
+```
+
+If instead we consider the Endolysosome network, the bulk of the distribution shifts down to around 25%.  
+
+```{r, fig.width=8, fig.height=5}
+mod.file %>% 
+  filter(
+    pct_term > 0
+    # , n_symbol > 5
+    , n_nw >= 3
+    ) %>% 
+  select(Biodomain, MODULE, pct_term) %>% 
+  distinct() %>% 
+  ggplot(.,aes(pct_term)) + 
+  # geom_vline(xintercept = c(25,50,75), lty = 2, lwd = .2, color = 'grey30')+
+  geom_histogram(color = 'grey20',fill = 'grey80', bins = 25)+
+  # geom_density()+
+  # stat_ecdf(geom = "step")+
+  labs(x = '% GO term genes in NW', 
+       subtitle = 'distribution of all terms >0% and >=3 genes in Endolysosome NW')
+# +
+#   facet_wrap(~Biodomain, scales = 'free_y')
+```
+
+This is shown more clearly when the two density distributions are plotted together. It seems from this that 50% representation is a reasonable cutoff to include the GO term as a module in the KDA.  
+
+```{r}
+bind_rows(
+  mod.file %>% 
+    filter( pct_term > 0, n_nw >= 3 ) %>% 
+    select(Biodomain, MODULE, pct_term) %>% 
+    distinct() %>% 
+    mutate(nw = 'biodom'), 
+  
+  mod.file.filt.base %>% 
+    filter( pct_term > 0, n_nw >= 3 ) %>% 
+    select(Biodomain, MODULE, pct_term) %>% 
+    distinct() %>% 
+    mutate(nw = 'base')
+) %>% 
+  ggplot(.,aes(pct_term)) + 
+  # geom_vline(xintercept = c(25,50,75), lty = 2, lwd = .2, color = 'grey30')+
+  # geom_histogram(color = 'grey20',fill = 'grey80', bins = 25)+
+  geom_density(aes(fill = nw), alpha = .5)+
+  # stat_ecdf(geom = "step")+
+  labs(x = '% GO term genes in NW', 
+       subtitle = 'distribution of all terms >0% and >=3 genes in each NW')
+
+
+```
+
+Applying this filter (i.e. only including GO terms with at least 3 genes in the network and over 50% of the term represented), here is the breakdown of GO terms used as modules for KDA. Most terms are from the Endolysosome domain, with others coming from primarily from Synapse, with Proteostasis, Immune Response, Lipid Metabolism, and Autophagy contributing several terms.  
+
+```{r, fig.width=8, fig.height=5}
+mod.file %>% 
+  filter(
+    pct_term > 50
+    # , n_symbol > 5
+    , n_nw >= 3
+    ) %>% 
+  select(Biodomain, MODULE, pct_term) %>% 
+  distinct() %>% 
+  ggplot(.,aes(pct_term)) + 
+  geom_vline(xintercept = c(25,50,75), lty = 2, lwd = .2, color = 'grey30')+
+  geom_histogram(color = 'grey20',fill = 'grey80', bins = 25)+
+  # geom_density()+
+  # stat_ecdf(geom = "step")+
+  labs(x = '% GO term genes in NW', 
+       subtitle = 'distribution of all terms >0% and >=3 genes in Endolysosome NW')+
+  facet_wrap(~Biodomain, scales = 'free_y')
+```
+
+# run KDA
+set KDA parameters
+```{r}
+label <- 'endo_50pct_3genes_'
+folder <- paste0(here::here(), '/results/test')
+
+write_tsv(nw.file, paste0(here::here(), '/results/test/network_file.tsv'))
+write_tsv(
+  mod.file %>% 
+    filter( pct_term > 50, n_nw >= 3) %>% 
+    select(MODULE, NODE) %>% distinct()
+  , paste0(here::here(), '/results/test/module_file.tsv'))
+
+directed = F
+edgybois <- c(0,1)
+```
+
+
+Run KDA (reduce the number of permutations to 5k to speed things up)  
+```{r warning=FALSE}
+for(ef in edgybois){
+
+  ### Setup KDA job
+  job.kda <- list()
+  # job.kda$label<-paste0(weight_type,'_',ef)  #filename
+  job.kda$label<- paste0(label, ef)  #filename
+  job.kda$folder<-paste0(here::here(), '/results/test')  #path  , '_depth2'
+  job.kda$netfile <- paste0(here::here(), '/results/test/network_file.tsv')
+  job.kda$modfile <- paste0(here::here(), '/results/test/module_file.tsv')
+  job.kda$edgefactor<- ef  #edgybois
+  job.kda$depth<- 1
+  if(directed) {job.kda$direction <- 1} else {job.kda$direction <- 0}
+  job.kda$nperm <- 5000  #100000
+  moddata <- tool.read(job.kda$modfile)
+  ## save this to a temporary file and set its path as new job.kda$modfile:
+  tool.save(moddata, "subsetof.supersets.txt")
+  job.kda$modfile <- "subsetof.supersets.txt"
+
+  ## Running KDA
+  job.kda <- kda.configure(job.kda)
+  job.kda <- kda.start(job.kda)
+  job.kda <- kda.prepare(job.kda)
+  job.kda <- kda.analyze(job.kda)
+  job.kda <- kda.finish(job.kda)
+
+}
+```
+
+# analyze kda results
+
+Get node attributes
+```{r}
+nodes <- v_info(trace.nw.bdFilt)
+edges <- e_info(trace.nw.bdFilt)
+```
+
+Read the KDA results from the unfiltered runs (from Synapse) and the filtered runs (locally). Include the node status, biodomain annotation, and term representation within the NW as additional information.  
+```{r}
+endo.kd <- read_kd_remote(
+  doms %>% filter(bd == 'Endolysosome') %>% pull(nw.dir) %>% .[[1]] %>% filter(name == 'kda') %>% pull(id)
+  ) %>% 
+  left_join(
+    ., nodes %>% select(NODE = name, node_status)
+  ) %>% 
+  left_join(
+    ., biodom %>% select(MODULE = GOterm_Name, Biodomain, abbr:color) 
+  ) %>% 
+  left_join(
+    ., mod.file %>% select(MODULE, n_symbol:pct_term) %>% distinct()
+  ) %>% 
+  mutate(set = 'unfilt')
+
+
+endo.kd <- read_kd_local( paste0(here::here(), '/results/test/kda') ) %>% 
+  left_join(
+    ., nodes %>% select(NODE = name, node_status)
+  ) %>% 
+  left_join(
+    ., biodom %>% select(MODULE = GOterm_Name, Biodomain, abbr:color)
+  ) %>% 
+  left_join(
+    ., mod.file %>% select(MODULE, n_symbol:pct_term) %>% distinct()
+  ) %>% 
+  mutate(set = 'filt') %>% 
+  bind_rows(.,endo.kd)
+```
+
+Many more KD terms from the unfiltered analysis are from terms with poor representation within the network.  
+
+```{r}
+endo.kd %>% 
+  filter(top == 1, ef1_fdr > -log10(0.05), delta_fdr > 0) %>% 
+  ggplot(aes(pct_term))+
+  geom_histogram(aes(fill = set), alpha = .5, position = 'dodge')
+```
+
+The KD have similar distribution of statistics, though there are many more KDs from the unfiltered analysis.  
+
+```{r}
+endo.kd %>% 
+  filter(top == 1, ef1_fdr > -log10(0.05), delta_fdr > 0) %>%
+  arrange(desc(set)) %>% 
+  ggplot(aes(ef1_fdr, delta_fdr, color = set))+
+  geom_point(alpha = .3)
+```
+
+The KDs that are present in the unfiltered networks seem to be for terms that are poorly represented in the network. Notably, it seems that the KDs that are >50% are come from largely similar Biodomain and FDR.  
+
+```{r}
+endo.kd %>% 
+  filter(top == 1, ef1_fdr > -log10(0.05), delta_fdr > 0) %>%
+  ggplot(aes(ef1_fdr, pct_term, fill = color))+
+  geom_point(alpha = .5, size = 2, shape = 21)+
+  scale_fill_identity()+
+  facet_wrap(~set)
+```
+
+Only plotting the terms from each analysis that are >50%, the distributions are very similar for both analyses.  
+
+```{r}
+endo.kd %>% 
+  filter(top == 1, ef1_fdr > -log10(0.05), delta_fdr > 0, pct_term > 50) %>%
+  ggplot(aes(ef1_fdr, delta_fdr, fill = color))+
+  geom_point(alpha = .5, size = 2, shape = 21)+
+  scale_fill_identity()+
+  facet_wrap(~set)
+```
+
+Are they the same nodes? Largely, yes. The statistics calculated for each NODE-MODULE pair are extremely similar between analyses. There are a few points along the x- and y-axes (i.e. present in one, but not the other).    
+
+```{r}
+endo.kd %>% 
+  filter(top == 1, ef1_fdr > -log10(0.05), delta_fdr > 0, pct_term > 50) %>%
+  pivot_wider(id_cols = c(MODULE, NODE, Biodomain, pct_term, color), 
+              names_from = set, values_from = c(ef1_fdr, delta_fdr)) %>% 
+  pivot_longer(cols = c('ef1_fdr_filt', 'delta_fdr_filt', 'ef1_fdr_unfilt','delta_fdr_unfilt'), 
+               names_to = c('metric','set'), names_sep = '_fdr_') %>% 
+  mutate(value = if_else(is.na(value), 0, value)) %>% 
+  pivot_wider(names_from = 'set',values_from = 'value') %>% 
+  ggplot(aes(unfilt, filt, fill = color))+
+  geom_point(alpha = .5, shape = 21, size = 2)+
+  scale_fill_identity()+
+  facet_wrap(~metric, scales = 'free')
+```
+
+
+# session
+```{r}
+sessionInfo()
+```
+

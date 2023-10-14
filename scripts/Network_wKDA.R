@@ -129,7 +129,8 @@ if( !(dir.exists( paste0(full_path,'/kda') )) ){
 # read traced, filtered NW objects
 trace.nw.bdFilt <- igraph::read_graph(
   paste0( full_path, '/',
-          'bdFiltered_', working_path,directionality, filt,
+          'bdFiltered_',
+          working_path, directionality, filt,
           '.graphml'),
   format = "graphml"
 )
@@ -155,7 +156,6 @@ nw.simple <- igraph::simplify(
     directed = 'max'
   )
 )
-
 
 # Add TREAT-AD scores to edge attributes
 kda.nw <- tibble( ea = edge.attributes(nw.simple) ) %>% 

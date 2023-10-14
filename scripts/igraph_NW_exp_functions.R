@@ -1,3 +1,34 @@
+#' Get vertex attributes
+#' 
+#' stores the vertex attributes from a network in a tibble
+#'
+#' @export
+#' @param net is an igraph network object
+#' @return tibble of the vertex attributes for each vertex in the network
+#' @examples 
+#' e_info(igraph_network)
+v_info <- function(net){
+  v.attr <- tibble( na = vertex.attributes(net) ) %>%
+    t() %>% 
+    as_tibble(rownames = NA, .name_repair = ~vertex_attr_names(net) ) %>% 
+    unnest(everything()) 
+}
+
+#' Get edge attributes
+#' 
+#' stores the edge attributes from a network in a tibble
+#'
+#' @export
+#' @param net is an igraph network object
+#' @return tibble of the edge attributes for each edge in the network
+#' @examples 
+#' e_info(igraph_network)
+e_info <- function(net){
+  e.attr <- tibble( ea = edge.attributes(net) ) %>% 
+    t() %>% 
+    as_tibble(rownames = NA, .name_repair = ~edge_attr_names(net) ) %>% 
+    unnest(everything()) 
+}
 
 #' Pull the names of a PathTrace
 #' 
@@ -377,7 +408,7 @@ find_limit <- function ( s_path, t_path, weights, cores=1) {
 #'     sentinals = genelists$sentinals$Immune_Response,
 #'     cores = 1
 #' )
-short_paths <- function( tnet, target, targets, sentinals, cores = 1 ){
+short_paths <- function( tnet, target, targets, sentinals, edge_weights = NULL, cores = 1 ){
   message( paste0( '\nWorking on: ', target, 
                    ' [', which(targets == target), '/', length(targets), ']'))
   # Pull paths that have median OMICS Score. ( Need to integrate a Genetics+Genomics Measure )
@@ -393,7 +424,8 @@ short_paths <- function( tnet, target, targets, sentinals, cores = 1 ){
     snet,
     from = target,
     to = igraph::V(snet)[ names(igraph::V(snet)) %in% targets ],
-    mode = c("all")
+    mode = c("all"),
+    weights = edge_weights
   ) 
   
   # All Shortest paths from target to Sentinel Genes
@@ -401,7 +433,8 @@ short_paths <- function( tnet, target, targets, sentinals, cores = 1 ){
     snet,
     from = target,
     to = igraph::V(snet)[ names(igraph::V(snet)) %in% sentinals ],
-    mode = c("all")
+    mode = c("all"),
+    weights = edge_weights
   )
   
   ## Find the limit cut off

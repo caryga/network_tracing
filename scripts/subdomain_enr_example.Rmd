@@ -1,0 +1,285 @@
+---
+title: "Sub-domain enrichment example code"
+author: "Greg Cary"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    fig_width: 5
+    fig_height: 4
+  html_notebook:
+    code_folding: hide
+    theme: readable
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+# Setup
+Load packages:  
+```{r setup}
+# Package names
+packages <- c(
+  'synapser','fgsea','tidyverse'
+  )
+
+# Load packages
+invisible(lapply(packages, library, character.only = TRUE))
+
+theme_set(theme_bw())
+```
+
+Define functions:  
+```{r}
+#This function quantifies the number of significantly enriched GO terms
+#by AD biological domain
+bd.tally <- function( enrVct, biodomDefTbl){
+  bdt <- bind_cols(
+    domain = unique(biodomDefTbl$Biodomain),
+    n_term = map_dbl( unique(biodomDefTbl$Biodomain),
+                      ~ biodomDefTbl %>% filter(Biodomain == .x) %>% 
+                        dplyr::select(GOterm_Name) %>% distinct() %>% nrow()),
+    n_sig_term = map_dbl( unique(biodomDefTbl$Biodomain),
+                          ~ enrVct[ enrVct %in% 
+                                      biodomDefTbl$GOterm_Name[
+                                        biodomDefTbl$Biodomain == .x]] %>% 
+                            length()) ) %>% 
+    bind_rows(
+      ., 
+      tibble(domain = 'none', 
+             n_term = setdiff(enrVct, biodomDefTbl$GOterm_Name) %>% length(), 
+             n_sig_term = setdiff(enrVct, biodomDefTbl$GOterm_Name) %>% length())
+      ) %>% 
+    mutate(domain = fct_reorder(domain, n_sig_term, .desc = F)) %>% 
+    arrange(domain)
+  bdt$prop <- bdt$n_sig_term / bdt$n_term
+  return(bdt)
+}
+
+# this function 
+# - annotates GO term enrichment results with biodomain 
+anno.enr <- function(enr_res_table, GO_ID_column, biodomain_table, domain_colors){
+    
+    enr <- left_join(
+        enr_res_table %>% rename(GO_ID = GO_ID_column) ,
+        biodomain_table %>% select( GO_ID, Biodomain ), 
+        by='GO_ID') %>% 
+      full_join(
+        ., 
+        domain_colors, 
+        by = c('Biodomain'='domain')) %>%  
+      mutate(
+        Biodomain = case_when(is.na(Biodomain)~'none', T~ Biodomain),
+        color = case_when(is.na(color)~'#7f7f7f', T~color)
+        ) 
+    
+    return(enr)
+}
+```
+
+Data from synapse:  
+```{r download data from synapse }
+synLogin()
+
+# target risk scores
+scores <- read_csv(
+  synTableQuery('select * from syn25575156', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+omics <- read_csv(
+  synTableQuery('select * from syn22758536', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+# biological domain annotations
+biodom <- full_join(
+  
+  # biodomains
+  readRDS(synGet('syn25428992')$path),
+  
+  # domain labels
+  read_csv(synGet('syn26856828')$path, col_types = cols()),  
+  
+  by = c('Biodomain'='domain')
+  ) %>% mutate(Biodomain = if_else(Biodomain == 'none', NA_character_, Biodomain))
+
+domains = biodom %>% pull(Biodomain) %>% unique() %>% sort()
+
+# enriched biodomain terms
+enr.bd <- read_csv( synGet('syn45824995')$path, col_types = cols() ) %>% 
+  mutate(leadingEdge_genes = str_split(leadingEdge_genes, '\\|'))
+```
+
+Draft sub-domains, so far only Synapse, Mitochondrial Metabolism, Immune Response, Epigenetics, and Lipid Metabolism domains have identified sub-domains  
+```{r load sub-domain definitions }
+subdom <- readxl::read_xlsx(
+  synGet('syn52331310')$path,
+  sheet = 1, 
+  col_names = T
+)
+
+subdom$Biodomain[which(subdom$Biodomain == 'Epigenetics')] <- 'Epigenetic'
+```
+
+# Explore enriched terms by sub-domain {.tabset} 
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=15, fig.height=12}
+tmp <- full_join( enr.bd, 
+                  subdom %>% select(Biodomain, ID = GO_ID, Subdomain, TopSD),
+                  by = c('Biodomain','ID')) %>% 
+  group_by(Biodomain, Subdomain) %>% 
+  mutate(sub_dom = pathway[TopSD == 1]) %>% 
+  ungroup()
+
+bd = unique(subdom$Biodomain)
+
+for(i in 1:length(bd)) {
+  cat("  \n##",  bd[i], "  \n")
+  
+  tmp1 <- tmp %>% filter(Biodomain == bd[i])
+  
+  p = ggplot(data = subset(tmp1, Biodomain != 'none'), aes(NES, -log10(padj)))+
+    geom_vline(xintercept = 1.7, lty = 2, lwd = .2, color = 'grey30')+
+    geom_hline(yintercept = -log10(0.01), lty = 2, lwd = .2, color = 'grey30')+
+    # geom_smooth(method = "lm", formula = y ~ poly(x, 2), lwd = .2)+
+    geom_point(
+      data = subset(tmp1, padj > 0.05 & Biodomain != 'none'),
+      shape = 21, size = .2, alpha = .3, color = 'grey20')+
+    geom_point(
+      data = subset(tmp1, padj <= 0.05 & Biodomain != 'none'),
+      shape = 21, color = 'grey50', alpha = .3, 
+      aes(fill = color, size = size ))+
+    scale_fill_identity()+
+    theme(legend.position = 'top')+
+    ggrepel::geom_label_repel(
+      data = subset(tmp1, padj < 0.01 & NES > 1.7 & Biodomain != 'none'),
+      aes(label = str_trunc(pathway, 40, 'right',)),
+      size = 2.5, alpha = .7, min.segment.length = 0, max.overlaps = 10
+    )+
+    facet_wrap(~sub_dom, scales = 'free')
+  
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+# Enrich sub-domains
+
+First specify a list of pathways to enrich. We'll use all biodomain terms and create new entries for each sub-domain.  
+
+```{r}
+# generate a list of all biodomain terms
+biodom.annotated <- biodom %>% 
+  filter(!is.na(n_symbol)) %>% 
+  select(-Biodomain) %>% 
+  distinct() %>% 
+  pull(symbol, name=GOterm_Name)
+
+# add sub-domain terms
+sd_terms <- subdom %>% 
+  rename(ID = GO_ID) %>%
+  left_join(., biodom %>% select(Biodomain, abbr)) %>%
+  group_by(Biodomain, Subdomain) %>% 
+  mutate(sub_dom = paste0(abbr, '_SD_',GOterm_Name[TopSD == 1])) %>% 
+  group_by(Biodomain, sub_dom) %>% 
+  summarise(
+    genes = biodom %>% filter(GO_ID %in% ID) %>% pull(symbol) %>% unlist() %>% unique() %>% list()
+    ) %>% 
+  pull(genes, name = sub_dom)
+
+# add sd terms to all biodomain GO terms
+biodom.annotated = c(sd_terms, biodom.annotated)
+
+```
+
+set up genelist - use the Overall TRS to stratify genes  
+```{r}
+gl <- scores %>% 
+  arrange(desc(Overall)) %>% 
+  filter(!is.na(GeneName), !duplicated(GeneName), !is.na(Overall)) %>%
+  pull(Overall, name=GeneName)
+```
+
+run GSEA analysis (this can take a while, and is aided by maximizing the number of cores used via the ```nproc``` parameter)  
+```{r}
+bd.fgsea <-  fgseaMultilevel( pathways   = biodom.annotated,
+                                stats      = gl, 
+                                minSize    = 1,
+                                maxSize    = Inf,
+                                scoreType  = 'pos',
+                                eps        = 0,
+                                nproc      = 4 )
+```
+
+tally biodomain GO terms (note: function does not account for sub-domain terms, those should be in the ```none``` category)  
+```{r}
+bdt <- bd.tally(bd.fgsea$pathway[bd.fgsea$padj <= 0.05], biodom)
+
+DT::datatable(bdt) %>% 
+  DT::formatSignif(columns = 'prop', digits = 2)
+```
+
+Looks like 42 out of the ```r length(sd_terms)``` are significantly enriched in this analysis.  
+
+look at the top-enriched sub-domains
+```{r fig.height=10, fig.width=10, warning=FALSE, message=FALSE}
+bd.filt.fgsea <- bd.fgsea %>% 
+  filter(grepl('_SD_', pathway), ES > 0, padj < 0.05 ) %>% 
+  arrange(desc(NES)) %>% distinct() %>% head(n = 42) %>% pull(pathway)
+
+gridExtra::grid.arrange( 
+  plotGseaTable(biodom.annotated[bd.filt.fgsea], gl, bd.fgsea, colwidths = c(5,2,1,0,1), render = TRUE) 
+  )
+```
+
+plot the whole list:  
+```{r}
+enr <- bd.fgsea %>% 
+  mutate(
+    sd_term = if_else(grepl('_SD_', pathway), T, F),
+    bd_abbr = if_else(sd_term, substr(pathway, 1,2), NA_character_)
+    ) %>% 
+  left_join(., biodom %>% select(pathway=GOterm_Name, Biodomain, color)) %>% 
+  left_join(., biodom %>% select(bd_abbr = abbr, Biodomain, color), by = 'bd_abbr') %>% 
+  distinct() %>% 
+  mutate(
+    Biodomain = coalesce(Biodomain.x, Biodomain.y),
+    color = coalesce(color.x, color.y),
+    Biodomain = fct_relevel(Biodomain, as.character(bdt$domain)) )
+
+enr %>%     
+    ggplot(aes(Biodomain, NES ))+ theme_minimal()+
+    scale_color_identity()+ scale_fill_identity()+
+    scale_size_continuous(
+        limits = -log10(enr$padj) %>% range(),
+        range = c(.7,5))+
+    geom_jitter( 
+        data = subset(enr, padj > 0.05),
+        color = 'grey85', alpha = .2, size = .5, show.legend = F)+
+    geom_jitter(
+        data = subset(enr, padj < 0.05 & !(pathway %in% idx[[.x]]) & Biodomain == domains[.x]), 
+        aes(color = color, size = -log10(padj) ), 
+        alpha = .5, show.legend = T)+
+    geom_jitter(
+        data = subset(enr, pathway %in% idx[[.x]]), 
+        aes(color = color, size = -log10(padj)), 
+        alpha = .5, shape = 15, show.legend = F)+
+    geom_violin(
+        data = subset(enr, padj < 0.05 & Biodomain == domains[.x]),
+        scale='width', aes(fill = color), color = 'grey50',#, color = col
+        alpha = .3, show.legend = F)+
+    geom_violin(
+        data = subset(enr, padj < 0.05 & Biodomain != domains[.x]),
+        scale='width', color = 'grey50',#, color = col
+        alpha = .3, show.legend = F)+
+    labs(x='')+  coord_flip() + theme(legend.position = 'right')
+)
+
+```
+
+# session
+```{r}
+sessionInfo()
+```
+
+# EOF

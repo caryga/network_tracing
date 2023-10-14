@@ -1,0 +1,1893 @@
+---
+title: "Enriched Biodomain Terms & Pathtrace Input"
+author: "Greg Cary"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    fig_width: 5
+    fig_height: 4
+  html_notebook:
+    code_folding: hide
+    theme: readable
+    css: style.css
+    toc: true
+    toc_float: true
+---
+# Setup
+
+```{r setup}
+# # Package names
+# packages <- c(
+#   # 'paxtoolsr','org.Hs.eg.db','HotNetvieweR','clusterProfiler', 
+#   'synapser','igraph','tidygraph','ggraph','tidyverse'
+#   )
+# 
+# # Load packages
+# invisible(lapply(packages, library, character.only = TRUE))
+
+library(synapser)
+library(googlesheets4)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(tidyverse)
+
+source('../../treatAD_biodomains/scripts/biodom_tally.R')
+source('../../treatAD_biodomains/scripts/annotate_enr_term_biodomains.R')
+source('../../treatAD_biodomains/scripts/biodom_enr_plots.R')
+
+theme_set(theme_bw())
+```
+
+# Data
+Grab relevant data from synapse, including:
+1) Target Risk Scores ([syn25575156](https://www.synapse.org/#!Synapse:syn25575156){target="_blank"}) and Omics Scores ([syn22758536](https://www.synapse.org/#!Synapse:syn22758536){target="_blank"})   
+2) Biodomain Definitions ([syn25428992](https://www.synapse.org/#!Synapse:syn25428992){target="_blank"})   
+3) Biodomain Term Annotation Kappa scores ([syn51163744](https://www.synapse.org/#!Synapse:syn51163744){target="_blank"}) & Network ([syn51497240](https://www.synapse.org/#!Synapse:syn51497240){target="_blank"})   
+3) Risk-enriched Biodomain Terms ([syn45824995](https://www.synapse.org/#!Synapse:syn45824995){target="_blank"})  
+4) Risk-enriched Biodomain Term Network ([syn51387897](https://www.synapse.org/#!Synapse:syn51387897){target="_blank"})  
+5) Base Network ([syn51110930](https://www.synapse.org/#!Synapse:syn51110930){target="_blank"})  
+
+```{r}
+synLogin()
+
+# target risk scores
+scores <- read_csv(
+  synTableQuery('select * from syn25575156', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+omics <- read_csv(
+  synTableQuery('select * from syn22758536', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+# biological domain annotations
+biodom <- full_join(
+  
+  # biodomains
+  readRDS(synGet('syn25428992')$path),
+  
+  # domain labels
+  read_csv(synGet('syn26856828')$path, col_types = cols()),  
+  
+  by = c('Biodomain'='domain')
+  ) %>% mutate(Biodomain = if_else(Biodomain == 'none', NA_character_, Biodomain))
+
+domains = biodom %>% pull(Biodomain) %>% unique() %>% sort()
+
+subdomains <- biodom %>% select(Biodomain, subdomain_idx, Subdomain) %>% 
+  distinct() %>% filter(subdomain_idx != 0)
+
+# # biodomain term annotation kappa scores
+# biodom.kappa <- read_csv(synapser::synGet('syn51163744')$path) %>% 
+#   left_join(., biodom %>% select(goid_1 = GO_ID, n_gene1 = n_symbol), by = 'goid_1') %>%
+#   left_join(., biodom %>% select(goid_2 = GO_ID, n_gene2 = n_symbol), by = 'goid_2') %>%
+#   distinct() %>%
+#   filter(goid_1 != goid_2,
+#          kappa > 0.1,
+#          n_gene1 > 3,
+#          n_gene2 > 3)
+
+# biodomain term annotation network
+biodom.nw <- igraph::read_graph(synGet('syn51497240')$path, format = 'graphml') 
+
+# enriched biodomain terms
+# enr.bd <- read_csv( synGet('syn45824995')$path, col_types = cols() ) %>% 
+#   mutate(leadingEdge_genes = str_split(leadingEdge_genes, '\\|'))
+
+enr.scores <- readRDS(
+  '/projects/carter-lab/caryg/treatAD_biodomains/results/risk_score_biodom_enrichments.rds'
+  )
+enr.bd <- enr.scores$anno[[3]] %>% 
+  mutate(leadingEdge_genes = str_split(core_enrichment, '\\/'))
+
+
+# enriched biodomain term network
+# enr.nw <- igraph::read_graph(synGet('syn51387897')$path, format = 'graphml') 
+
+# base network
+base.net <- igraph::read_graph(synGet('syn51110930')$path, format = 'graphml') 
+
+# specify directed edge types
+directed_edge_types = c("catalysis-precedes",
+                        "controls-expression-of",
+                        "controls-phosphorylation-of",
+                        "controls-state-change-of",
+                        "controls-transport-of"
+                        )
+
+```
+
+## J Wiley draft sub-domains
+
+So far just Synapse, Mitochondrial Metabolism, Immune Response, Epigenetics, and Lipid Metabolism  
+```{r}
+subdom <- readxl::read_xlsx(
+  paste0(here::here(), '/data/Subendophenotype Trackers.xlsx'),
+  sheet = 1, 
+  col_names = T
+)
+
+subdom$Biodomain[which(subdom$Biodomain == 'Epigenetics')] <- 'Epigenetic'
+```
+
+
+## plot subnetwork
+```{r}
+plot_kd_subnet <- function(nw, kd, term) {
+  
+  vert_num <- match(kd, V(nw)$name)
+  
+  vert_neigh <- neighbors(nw, vert_num)
+  
+  term_num <- biodom %>%
+    filter(GOterm_Name == term) %>%
+    pull(symbol) %>% unlist() %>%
+    match(., V(nw)$name) %>% .[!is.na(.)]
+  
+  g2 <- induced_subgraph(nw, c(vert_num, intersect(term_num, vert_neigh)))
+  g3 <- induced_subgraph(nw, c(vert_num, term_num))
+  
+  cowplot::plot_grid(
+    
+    ggraph(g3, layout = 'linear', circular = TRUE) +
+      geom_edge_arc(alpha = .3, color = 'grey75') +
+      geom_node_point( shape = 21, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter= .N()$name != kd)  )+
+      geom_node_point( shape = 23, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter = .N()$name == kd) )+
+      geom_node_text(aes(label = name), size = 2) +
+      coord_fixed() +
+      scale_size_continuous( range = c(.5, 10), limits = c(0, 5), trans = 'exp')+
+      scale_fill_gradient2(
+        low = 'purple', mid = 'grey20', high = 'green', na.value = 'grey85',
+        limits = c(-2.5,2.5) )+ #approx: range(omics$Pro_TE, na.rm = T)
+      labs( title = 'All term genes in NW',
+            subtitle = paste0('KD: ', kd, '\nTerm: ', term) )+
+      theme_graph(background = 'white')
+    ,
+    ggraph(g2, layout = 'linear', circular = TRUE) +
+            geom_edge_arc(alpha = .3, color = 'grey75') +
+      geom_node_point( shape = 21, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter= .N()$name != kd)  )+
+      geom_node_point( shape = 23, color = "black", alpha = .3,
+        aes(size = TargetRiskScore, fill = Pro_EffectScore, filter = .N()$name == kd) )+
+      geom_node_text(aes(label = name), size = 2) +
+      coord_fixed() +
+      scale_size_continuous( range = c(.5, 10), limits = c(0, 5), trans = 'exp')+
+      scale_fill_gradient2(
+        low = 'purple', mid = 'grey20', high = 'green', na.value = 'grey85',
+        limits = c(-2.5,2.5) )+ #approx: range(omics$Pro_TE, na.rm = T)
+      labs( title = 'Term genes & KD neighbors in NW',
+            subtitle = paste0('KD: ', kd, '\nTerm: ', term) )+
+      theme_graph(background = 'white')
+    ,
+    ncol = 2
+    
+  )
+}
+```
+
+
+
+# Enriched Biodomain terms
+
+## Enriched terms by biodomain
+```{r fig.width=15, fig.height=12}
+
+ggplot(data = subset(enr.bd, Biodomain != 'none'), aes(NES, -log10(padj)))+
+  geom_vline(xintercept = 1.7, lty = 2, lwd = .2, color = 'grey30')+
+  geom_hline(yintercept = -log10(0.01), lty = 2, lwd = .2, color = 'grey30')+
+  # geom_smooth(method = "lm", formula = y ~ poly(x, 2), lwd = .2)+
+  geom_point(
+    data = subset(enr.bd, padj > 0.05 & Biodomain != 'none'),
+    shape = 21, size = .2, alpha = .3, color = 'grey20')+
+  geom_point(
+    data = subset(enr.bd, padj <= 0.05 & Biodomain != 'none'),
+    shape = 21, color = 'grey50', alpha = .3, 
+    aes(fill = color, size = size ))+
+  scale_fill_identity()+
+  theme(legend.position = 'top')+
+  ggrepel::geom_label_repel(
+    data = subset(enr.bd, padj < 0.01 & NES > 1.7 & Biodomain != 'none'),
+    aes(label = str_trunc(pathway, 40, 'right',)),
+    size = 2.5, alpha = .7, min.segment.length = 0, max.overlaps = 10
+  )+
+  facet_wrap(~Biodomain, scales = 'free')
+
+```
+
+
+## Enriched terms by subdomain {.tabset}
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=15, fig.height=12}
+tmp <- full_join( enr.bd, 
+                  subdom %>% select(Biodomain, ID = GO_ID, Subdomain, TopSD),
+                  by = c('Biodomain','ID')) %>% 
+  group_by(Biodomain, Subdomain) %>% 
+  mutate(sub_dom = pathway[TopSD == 1]) %>% 
+  ungroup()
+
+bd = unique(subdom$Biodomain)
+
+for(i in 1:length(bd)) {
+  cat("  \n###",  bd[i], "  \n")
+  
+  tmp1 <- tmp %>% filter(Biodomain == bd[i])
+  
+  p = ggplot(data = subset(tmp1, Biodomain != 'none'), aes(NES, -log10(padj)))+
+    geom_vline(xintercept = 1.7, lty = 2, lwd = .2, color = 'grey30')+
+    geom_hline(yintercept = -log10(0.01), lty = 2, lwd = .2, color = 'grey30')+
+    # geom_smooth(method = "lm", formula = y ~ poly(x, 2), lwd = .2)+
+    geom_point(
+      data = subset(tmp1, padj > 0.05 & Biodomain != 'none'),
+      shape = 21, size = .2, alpha = .3, color = 'grey20')+
+    geom_point(
+      data = subset(tmp1, padj <= 0.05 & Biodomain != 'none'),
+      shape = 21, color = 'grey50', alpha = .3, 
+      aes(fill = color, size = size ))+
+    scale_fill_identity()+
+    theme(legend.position = 'top')+
+    ggrepel::geom_label_repel(
+      data = subset(tmp1, padj < 0.01 & NES > 1.7 & Biodomain != 'none'),
+      aes(label = str_trunc(pathway, 40, 'right',)),
+      size = 2.5, alpha = .7, min.segment.length = 0, max.overlaps = 10
+    )+
+    facet_wrap(~sub_dom, scales = 'free')
+  
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+ 
+
+## Examine p-value & NES thresholding
+```{r}
+thresh = crossing(
+  p = c(0.05, 0.01, 0.001, 1e-4, 1e-5, 1e-6),
+  nes = quantile( enr.bd$NES[enr.bd$padj < 0.05], c(.2,.3,.4,.5,.6,.7,.8,.9), na.rm = T)
+)
+
+x = tibble()
+
+for( bd in unique(enr.bd$Biodomain) ){
+  n_GO = map_dbl(
+    1:nrow(thresh), 
+    ~ enr.bd %>% filter(Biodomain == bd, NES > thresh$nes[.x], padj <= thresh$p[.x]) %>% pull(ID) %>% unique() %>% length()
+      )
+  n_LE_genes = map_dbl(
+    1:nrow(thresh), 
+    ~ enr.bd %>% filter(Biodomain == bd, NES > thresh$nes[.x], padj <= thresh$p[.x]) %>% pull(leadingEdge_genes) %>% unlist() %>% unique() %>% length()
+  )
+  
+  x <- tibble(
+    bd = bd,
+    n_GO = n_GO,
+    n_LE_genes = n_LE_genes
+  ) %>% 
+    bind_cols( thresh, .) %>% 
+    bind_rows( x, .)
+}
+
+thresh <- x %>% 
+  left_join(., biodom %>% select(bd = Biodomain, abbr:color) %>% distinct(), by = 'bd') %>% 
+  group_by(bd) %>% 
+  mutate(
+    pct_max_GO = n_GO / max(n_GO),
+    pct_max_LE = n_LE_genes / max(n_LE_genes)
+  ) 
+
+```
+
+Number of GO terms enriched at various thresholds  
+```{r fig.width=10, fig.height=8}
+ggplot(data = subset(thresh, bd!='none'), 
+       aes( as.factor(signif(p, 2)), as.factor(signif(nes, 2)) ))+
+  geom_point(aes(size = n_GO, fill = color), shape = 21, color = 'grey30', alpha = .9)+
+  labs(x = 'p-adjust threshold', y = 'NES threshold')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+
+  scale_size_continuous( limits = c(1,max(thresh$n_GO[thresh$bd!='none'])) )+
+  scale_fill_identity()+ 
+  facet_wrap(~bd)
+```
+
+Number of leading edge genes (i.e. input to path trace) at various thresholds  
+```{r fig.width=10, fig.height=8}
+ggplot(data = subset(thresh, bd!='none'), 
+       aes( as.factor(signif(p, 2)), as.factor(signif(nes, 2)) ))+
+  geom_point(aes(size = n_LE_genes, fill = color), shape = 21, color = 'grey30', alpha = .9)+
+  labs(x = 'p-adjust threshold', y = 'NES threshold')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+
+  scale_size_continuous( limits = c(1,max(thresh$n_LE_genes[thresh$bd!='none'])) )+
+  scale_fill_identity()+ 
+  facet_wrap(~bd)
+```
+
+Percent of maximum number of leading edge genes (i.e. input to path trace) at various thresholds  
+```{r fig.width=10, fig.height=8}
+ggplot(data = subset(thresh, bd!='none'), 
+       aes( as.factor(signif(p, 2)), as.factor(signif(nes, 2)) ))+
+  geom_point(aes(size = pct_max_LE, fill = color), shape = 21, color = 'grey30', alpha = .9)+
+  labs(x = 'p-adjust threshold', y = 'NES threshold')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+
+  scale_size_continuous( limits = c(1e-200,1) )+
+  scale_fill_identity()+ 
+  facet_wrap(~bd)
+```
+
+# GO term NWs clustering
+
+## JWiley sub-domains
+### GO term overlap between sub-domains {.tabset}
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=8, fig.height=6}
+
+bd <- subdom$Biodomain %>% unique %>% sort 
+
+# olap = tibble()
+
+for(i in 1:length(bd)) {
+  cat("  \n###",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i]) %>% 
+    group_by(Subdomain) %>% 
+    mutate(sub_dom = GOterm_Name[TopSD == 1]) %>% 
+    left_join(., biodom %>% select(GO_ID, symbol), by = 'GO_ID' ) %>% 
+    unnest(symbol) %>% 
+    group_by(Biodomain, Subdomain) %>% 
+    summarise(terms = GO_ID %>% unique() %>% list())
+
+  olap <- crossing(c = sd$Subdomain, b = sd$Subdomain) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = sd %>% filter(Subdomain == c) %>% pull(terms) %>% unlist() %>% length() ,
+      n_b = sd %>% filter(Subdomain == b) %>% pull(terms) %>% unlist() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             sd %>% filter(Subdomain == c) %>% pull(terms) %>% unlist(),
+             sd %>% filter(Subdomain == b) %>% pull(terms) %>% unlist()
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = str_remove_all(c, '.graphml'),
+      c = fct_reorder( as.factor(c), n_c),
+      b = str_remove_all(b, '.graphml'),
+      b = fct_reorder( as.factor(b), n_b)
+    ) 
+  
+    p = #cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Y", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Sub-domain',y='Sub-domain', 
+             title = bd[i],
+             subtitle = 'Sub-domain GO terms')
+      
+      # ggplot(olap, aes(x = c, y = b)) +
+      #   geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+      #   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+      #   # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+      #   # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+      #   viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+      #   # scale_x_discrete(position = "top") +
+      #   geom_text(aes(label = intersect ), size = 2.5) +
+      #   labs(x='Louvian Cluster',y='Sub-domain'),
+      # 
+      # nrow = 1
+      # )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+  }
+
+```
+
+### gene overlap between sub-domains {.tabset}
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=8, fig.height=6}
+
+bd <- subdom$Biodomain %>% unique %>% sort
+
+# olap = tibble()
+
+for(i in 1:length(bd)) {
+  cat("  \n###",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i]) %>% 
+    group_by(Subdomain) %>% 
+    mutate(sub_dom = GOterm_Name[TopSD == 1]) %>% 
+    left_join(., biodom %>% select(GO_ID, symbol), by = 'GO_ID' ) %>% 
+    unnest(symbol) %>% 
+    group_by(Biodomain, Subdomain) %>% 
+    summarise(genes = symbol %>% unique() %>% list())
+
+  olap <- crossing(c = sd$Subdomain, b = sd$Subdomain) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = sd %>% filter(Subdomain == c) %>% pull(genes) %>% unlist() %>% length() ,
+      n_b = sd %>% filter(Subdomain == b) %>% pull(genes) %>% unlist() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             sd %>% filter(Subdomain == c) %>% pull(genes) %>% unlist(),
+             sd %>% filter(Subdomain == b) %>% pull(genes) %>% unlist()
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = str_remove_all(c, '.graphml'),
+      c = fct_reorder( as.factor(c), n_c),
+      b = str_remove_all(b, '.graphml'),
+      b = fct_reorder( as.factor(b), n_b)
+    ) 
+  
+    p = #cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Y", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Sub-domain',y='Sub-domain', 
+             title = bd[i],
+             subtitle = 'Genes annotated to GO terms within sub-domain')
+      
+      # ggplot(olap, aes(x = c, y = b)) +
+      #   geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+      #   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+      #   # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+      #   # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+      #   viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+      #   # scale_x_discrete(position = "top") +
+      #   geom_text(aes(label = intersect ), size = 2.5) +
+      #   labs(x='Louvian Cluster',y='Sub-domain'),
+      # 
+      # nrow = 1
+      # )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+  }
+
+```
+
+## enriched term network
+### whole network
+#### GO terms
+```{r}
+enr.nw.louvian <- igraph::cluster_louvain(enr.nw, weights = E(enr.nw)$kappa )
+
+lclust <- tibble( clust = enr.nw.louvian$membership, terms = enr.nw.louvian$names) %>% 
+   nest(.,cols = terms)
+
+bd <- biodom %>% 
+  select(Biodomain, GO_ID) %>% 
+  nest(., cols = GO_ID) %>% 
+  filter(!is.na(Biodomain))
+
+olap <- crossing(c = lclust$clust, b = bd$Biodomain) %>% 
+  rowwise() %>% 
+  mutate(
+    n_c = lclust %>% filter(clust == c) %>% pull(cols) %>% unlist() %>% unique() %>% length(),
+    n_b = bd %>% filter(Biodomain == b) %>% pull(cols) %>% unlist() %>% unique() %>% length()
+  ) %>% 
+  group_by(c,b) %>% 
+  mutate(.keep = 'all', 
+         intersect = length(intersect(
+           lclust %>% filter(clust == c) %>% pull(cols) %>% unlist(),
+           bd %>% filter(Biodomain == b) %>% pull(cols) %>% unlist()
+           ))
+         ) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(.keep = 'all', 
+         pct_c = intersect / n_c,
+         pct_b = intersect / n_b ) %>%
+  ungroup() %>% 
+  mutate(
+    c = fct_reorder( as.factor(c), n_c),
+    b = fct_reorder( as.factor(b), n_b)
+  )
+
+
+```
+
+```{r fig.width=16, fig.height=6}
+
+cowplot::plot_grid(
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Biodomain", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Enr Term NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Enr Term NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  nrow = 1
+)
+
+
+```
+
+#### Genes annotated to terms
+```{r}
+enr.nw.louvian <- igraph::cluster_louvain(enr.nw, weights = E(enr.nw)$kappa )
+
+lclust <- tibble( clust = enr.nw.louvian$membership, terms = enr.nw.louvian$names) %>% 
+  left_join(., enr.bd %>% select(terms = ID, Biodomain, padj, NES, leadingEdge_genes) ) %>% 
+  unnest(leadingEdge_genes) %>% 
+  select(-NES, -padj) %>% 
+  group_by(Biodomain, clust) %>% 
+  summarise(terms = list(unique(terms)), genes = list(unique(leadingEdge_genes))) 
+
+bd <- biodom %>% 
+  select(Biodomain, GO_ID, genes = symbol) %>% 
+  group_by(Biodomain) %>% 
+  summarise(
+    terms = list(unique(GO_ID)),
+    genes = unlist(genes) %>% unique() %>% list()) %>% 
+  filter(!is.na(Biodomain))
+
+olap <- crossing(c = lclust$clust, b = bd$Biodomain) %>% 
+  rowwise() %>% 
+  mutate(
+    n_c = lclust %>% filter(clust == c) %>% pull(genes) %>% unlist() %>% unique() %>% length(),
+    n_b = bd %>% filter(Biodomain == b) %>% pull(genes) %>% unlist() %>% unique() %>% length()
+  ) %>% 
+  group_by(c,b) %>% 
+  mutate(.keep = 'all', 
+         intersect = length(intersect(
+           lclust %>% filter(clust == c) %>% pull(genes) %>% unlist(),
+           bd %>% filter(Biodomain == b) %>% pull(genes) %>% unlist()
+           ))
+         ) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(.keep = 'all', 
+         pct_c = intersect / n_c,
+         pct_b = intersect / n_b ) %>%
+  ungroup() %>% 
+  mutate(
+    c = fct_reorder( as.factor(c), n_c),
+    b = fct_reorder( as.factor(b), n_b)
+  )
+
+
+```
+
+```{r fig.width=16, fig.height=6}
+
+cowplot::plot_grid(
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Biodomain", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Enr Term NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Enr Term NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  nrow = 1
+)
+
+
+```
+
+
+### by biodomain, terms {.tabset}
+cluster sub-networks defined by biological domain annotation  
+```{r}
+x <- tibble(
+  bd = vertex_attr_names(enr.nw)[8:27],
+  n_subclust = NA_real_,
+  subclust = list(NA)
+)
+
+for(i in 1:nrow(x)){
+  rm_idx <- which( vertex_attr(enr.nw, x$bd[i]) != 1 ) 
+  tmp <- delete_vertices( enr.nw, rm_idx )
+  subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+  x$n_subclust[i] <- subclust$membership %>% unique %>% length
+  x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+    left_join(., biodom %>% select(id = GO_ID, GOterm_Name), by = 'id') 
+}
+
+i = which(x$bd == 'none')
+x$subclust[[i]] <- x$subclust[[i]] %>% 
+  left_join(., enr.bd %>% select(id = ID, name = pathway, size), by = 'id')
+
+enr.nw.bd.subclusters <- x
+```
+
+Compare with sub-domain annotations from Jesse  
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=16, fig.height=6}
+bd = unique(subdom$Biodomain)
+
+for(i in 1:length(bd)) {
+  cat("  \n####",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i])
+  
+  if( nrow(enr.nw.bd.subclusters[which(enr.nw.bd.subclusters$bd == bd[i]),]) == 0 ){ next }
+  
+  lc = enr.nw.bd.subclusters[which(enr.nw.bd.subclusters$bd == bd[i]),] %>% pull(subclust) %>% .[[1]] 
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$Subdomain) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(id) %>% unique() %>% length(),
+      n_b = sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(GO_ID) %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(id),
+             sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(GO_ID)
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b)
+    )
+
+  p = cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'GO terms in Enr Term NW Louvian Clusters vs Subdomains'),
+      
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'GO terms in Enr Term NW Louvian Clusters vs Subdomains'),
+      
+      nrow = 1
+      )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+### by biodomain, genes {.tabset}
+cluster sub-networks defined by biological domain annotation  
+```{r}
+x <- tibble(
+  bd = vertex_attr_names(enr.nw)[8:27],
+  n_subclust = NA_real_,
+  subclust = list(NA)
+)
+
+for(i in 1:nrow(x)){
+  rm_idx <- which( vertex_attr(enr.nw, x$bd[i]) != 1 ) 
+  tmp <- delete_vertices( enr.nw, rm_idx )
+  subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+  x$n_subclust[i] <- subclust$membership %>% unique %>% length
+  x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+    left_join(., biodom %>% select(id = GO_ID, GOterm_Name, symbol), by = 'id') 
+}
+
+i = which(x$bd == 'none')
+x$subclust[[i]] <- x$subclust[[i]] %>% 
+  left_join(., enr.bd %>% select(id = ID, name = pathway, size), by = 'id')
+
+enr.nw.bd.subclusters <- x
+```
+
+Compare with sub-domain annotations from Jesse  
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=16, fig.height=6}
+bd = unique(subdom$Biodomain)
+
+for(i in 1:length(bd)) {
+  cat("  \n####",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i]) %>% 
+    group_by(Subdomain) %>% 
+    mutate(sub_dom = GOterm_Name[TopSD == 1]) %>% 
+    left_join(., biodom %>% select(GO_ID, symbol), by = 'GO_ID' ) %>% 
+    unnest(symbol) %>% 
+    group_by(Biodomain, Subdomain) %>% 
+    summarise(symbol = symbol %>% unique() %>% list())
+  
+  if( nrow(enr.nw.bd.subclusters[which(enr.nw.bd.subclusters$bd == bd[i]),]) == 0 ){ next }
+  
+  lc = enr.nw.bd.subclusters[which(enr.nw.bd.subclusters$bd == bd[i]),] %>% 
+    pull(subclust) %>% .[[1]] %>% 
+    group_by(clust) %>% 
+    summarise(symbol = unlist(symbol) %>% unique() %>% list())
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$Subdomain) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length(),
+      n_b = sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique(),
+             sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(symbol) %>% unlist() %>% unique()
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b)
+    )
+
+  p = cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'Genes from Enr Term NW Louvian Clusters vs Subdomains'),
+      
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'Genes from Enr Term NW Louvian Clusters vs Subdomains'),
+      
+      nrow = 1
+      )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+## term annotation network
+### whole network
+#### GO terms
+```{r}
+biodom.nw.louvian <- igraph::cluster_louvain(biodom.nw, weights = E(biodom.nw)$kappa )
+
+lclust <- tibble( clust = biodom.nw.louvian$membership, terms = biodom.nw.louvian$names) %>% 
+   nest(.,cols = terms)
+
+bd <- biodom %>% 
+  select(Biodomain, GO_ID) %>% 
+  nest(., cols = GO_ID) %>% 
+  filter(!is.na(Biodomain))
+
+olap <- crossing(c = lclust$clust, b = bd$Biodomain) %>% 
+  rowwise() %>% 
+  mutate(
+    n_c = lclust %>% filter(clust == c) %>% pull(cols) %>% unlist() %>% unique() %>% length(),
+    n_b = bd %>% filter(Biodomain == b) %>% pull(cols) %>% unlist() %>% unique() %>% length()
+  ) %>% 
+  group_by(c,b) %>% 
+  mutate(.keep = 'all', 
+         intersect = length(intersect(
+           lclust %>% filter(clust == c) %>% pull(cols) %>% unlist(),
+           bd %>% filter(Biodomain == b) %>% pull(cols) %>% unlist()
+           ))
+         ) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(.keep = 'all', 
+         pct_c = intersect / n_c,
+         pct_b = intersect / n_b ) %>%
+  ungroup() %>% 
+  mutate(
+    c = fct_reorder( as.factor(c), n_c),
+    b = fct_reorder( as.factor(b), n_b)
+  )
+
+
+```
+
+```{r fig.width=16, fig.height=6}
+
+cowplot::plot_grid(
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Biodomain", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Term Annotation NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Term Annotation NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  nrow = 1
+)
+
+
+```
+
+#### Genes annotated to terms
+```{r}
+biodom.nw.louvian <- igraph::cluster_louvain(biodom.nw, weights = E(biodom.nw)$kappa )
+
+lclust <- tibble( clust = biodom.nw.louvian$membership, terms = biodom.nw.louvian$names) %>% 
+  left_join(., enr.bd %>% select(terms = ID, Biodomain, padj, NES, leadingEdge_genes) ) %>% 
+  unnest(leadingEdge_genes) %>% 
+  select(-NES, -padj) %>% 
+  group_by(Biodomain, clust) %>% 
+  summarise(terms = list(unique(terms)), genes = list(unique(leadingEdge_genes))) 
+
+bd <- biodom %>% 
+  select(Biodomain, GO_ID, genes = symbol) %>% 
+  group_by(Biodomain) %>% 
+  summarise(
+    terms = list(unique(GO_ID)),
+    genes = unlist(genes) %>% unique() %>% list()) %>% 
+  filter(!is.na(Biodomain))
+
+olap <- crossing(c = lclust$clust, b = bd$Biodomain) %>% 
+  rowwise() %>% 
+  mutate(
+    n_c = lclust %>% filter(clust == c) %>% pull(genes) %>% unlist() %>% unique() %>% length(),
+    n_b = bd %>% filter(Biodomain == b) %>% pull(genes) %>% unlist() %>% unique() %>% length()
+  ) %>% 
+  group_by(c,b) %>% 
+  mutate(.keep = 'all', 
+         intersect = length(intersect(
+           lclust %>% filter(clust == c) %>% pull(genes) %>% unlist(),
+           bd %>% filter(Biodomain == b) %>% pull(genes) %>% unlist()
+           ))
+         ) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(.keep = 'all', 
+         pct_c = intersect / n_c,
+         pct_b = intersect / n_b ) %>%
+  ungroup() %>% 
+  mutate(
+    c = fct_reorder( as.factor(c), n_c),
+    b = fct_reorder( as.factor(b), n_b)
+  )
+
+
+```
+
+```{r fig.width=16, fig.height=6}
+
+cowplot::plot_grid(
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Biodomain", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Enr Term NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+    # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+    viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+    # scale_x_discrete(position = "top") +
+    geom_text(aes(label = intersect ), size = 2.5) +
+    labs(x='Louvian Cluster',y='Biological Domain',
+         title = 'Enr Term NW Louvian clusters',
+         subtitle = 'GO term overlap with Biological domains'),
+  
+  nrow = 1
+)
+
+
+```
+### by biodomain, terms {.tabset}
+cluster sub-networks defined by biological domain annotation  
+```{r}
+x <- tibble(
+  bd = vertex_attr_names(biodom.nw)[9:27],
+  n_subclust = NA_real_,
+  subclust = list(NA)
+)
+
+for(i in 1:nrow(x)){
+  rm_idx <- which( vertex_attr(biodom.nw, x$bd[i]) != 1 ) 
+  tmp <- delete_vertices( biodom.nw, rm_idx )
+  subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+  x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+    left_join(., biodom %>% select(id = GO_ID, GOterm_Name), by = 'id') %>% 
+    filter(!is.na(GOterm_Name))
+  x$n_subclust[i] <- x$subclust[[i]]$clust %>% unique %>% length
+}
+
+biodom.nw.bd.subclusters <- x
+```
+
+Compare with sub-domain annotations from Jesse  
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=16, fig.height=6}
+bd = unique(subdom$Biodomain)
+
+for(i in 1:length(bd)) {
+  cat("  \n####",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i])
+  
+  if( nrow(biodom.nw.bd.subclusters[which(biodom.nw.bd.subclusters$bd == bd[i]),]) == 0 ){ next }
+  
+  lc = biodom.nw.bd.subclusters[which(biodom.nw.bd.subclusters$bd == bd[i]),] %>% pull(subclust) %>% .[[1]] 
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$Subdomain) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(id) %>% unique() %>% length(),
+      n_b = sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(GO_ID) %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(id),
+             sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(GO_ID)
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b)
+    )
+
+  p = cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'GO terms in Term Annotation NW Louvian Clusters vs Subdomains'),
+      
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'GO terms in Term Annotation NW Louvian Clusters vs Subdomains'),
+      
+      nrow = 1
+      )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+### by biodomain, genes {.tabset}
+cluster sub-networks defined by biological domain annotation  
+```{r}
+x <- tibble(
+  bd = vertex_attr_names(biodom.nw)[9:27],
+  n_subclust = NA_real_,
+  subclust = list(NA)
+)
+
+for(i in 1:nrow(x)){
+  rm_idx <- which( vertex_attr(biodom.nw, x$bd[i]) != 1 ) 
+  tmp <- delete_vertices( biodom.nw, rm_idx )
+  subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+  x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+    left_join(., biodom %>% select(id = GO_ID, GOterm_Name, symbol), by = 'id') %>% 
+    filter(!is.na(GOterm_Name))
+  x$n_subclust[i] <- x$subclust[[i]]$clust %>% unique %>% length
+}
+
+biodom.nw.bd.subclusters <- x
+```
+
+Compare with sub-domain annotations from Jesse  
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=16, fig.height=6}
+bd = unique(subdom$Biodomain)
+
+for(i in 1:length(bd)) {
+  cat("  \n####",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i]) %>% 
+    group_by(Subdomain) %>% 
+    mutate(sub_dom = GOterm_Name[TopSD == 1]) %>% 
+    left_join(., biodom %>% select(GO_ID, symbol), by = 'GO_ID' ) %>% 
+    unnest(symbol) %>% 
+    group_by(Biodomain, Subdomain) %>% 
+    summarise(symbol = symbol %>% unique() %>% list())
+  
+  if( nrow(biodom.nw.bd.subclusters[which(biodom.nw.bd.subclusters$bd == bd[i]),]) == 0 ){ next }
+  
+  lc = biodom.nw.bd.subclusters[which(biodom.nw.bd.subclusters$bd == bd[i]),] %>% 
+    pull(subclust) %>% .[[1]] %>% 
+    group_by(clust) %>% 
+    summarise(symbol = unlist(symbol) %>% unique() %>% list())
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$Subdomain) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length(),
+      n_b = sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique(),
+             sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(symbol) %>% unlist() %>% unique()
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b)
+    )
+
+  p = cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'Genes from Term Annotation NW Louvian Clusters vs Subdomains'),
+      
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd[i],
+             subtitle = 'Genes from Term Annotation NW Louvian Clusters vs Subdomains'),
+      
+      nrow = 1
+      )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+## term annotation network -- filtered for kappa
+
+### by biodomain, terms {.tabset}
+cluster sub-networks defined by biological domain annotation  
+```{r}
+biodom.nw.bd.subclusters <- tibble()
+
+for(j in c(0.3, 0.5, 0.7, 0.9, 0.95)){
+  
+  red.biodom.nw <- delete.edges(biodom.nw, E(biodom.nw)[E(biodom.nw)$kappa < j])
+
+  x <- tibble(
+    bd = vertex_attr_names(red.biodom.nw)[9:27],
+    kappa = j,
+    n_subclust = NA_real_,
+    subclust = list(NA)
+  )
+  
+  for(i in 1:nrow(x)){
+    rm_idx <- which( vertex_attr(red.biodom.nw, x$bd[i]) != 1 ) 
+    tmp <- delete_vertices( red.biodom.nw, rm_idx )
+    subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+    x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+      left_join(., biodom %>% select(id = GO_ID, GOterm_Name, n_symbol), by = 'id') %>% 
+      filter(!is.na(GOterm_Name)) %>% 
+      group_by(clust) %>% 
+      arrange(desc(n_symbol), .by_group = T) %>% 
+      ungroup()
+    x$n_subclust[i] <- x$subclust[[i]]$clust %>% unique %>% length
+  }
+  
+  biodom.nw.bd.subclusters <- bind_rows(biodom.nw.bd.subclusters, x)
+  
+}
+
+```
+
+```{r warning=FALSE}
+bd = biodom.nw.bd.subclusters %>% select(bd, kappa) %>% 
+  filter(bd %in% subdom$Biodomain)
+
+olap = tibble()
+
+for(i in 1:nrow(bd)) {
+  
+  x = bd$bd[i]
+  k = bd$kappa[i]
+  
+  sd = subdom %>% filter(Biodomain == x)
+  
+  lc = biodom.nw.bd.subclusters %>% filter(bd == x, kappa == k)
+  
+  if( nrow(lc$subclust[[1]]) == 0 ){ next }
+  
+  lc = lc %>% pull(subclust) %>% .[[1]] 
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$Subdomain) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(id) %>% unique() %>% length(),
+      n_b = sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(GO_ID) %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(id),
+             sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(GO_ID)
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b),
+      biodom = x,
+      kappa = k
+    ) %>% 
+    bind_rows(olap, .)
+}
+```
+
+
+Compare with sub-domain annotations from Jesse  
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=5, fig.height=12}
+
+bd = biodom.nw.bd.subclusters %>% select(bd) %>% 
+  filter(bd %in% subdom$Biodomain) %>% 
+  distinct()
+
+for(i in 1:nrow(bd)) {
+
+  cat("  \n####",  bd$bd[i], "  \n")
+
+  tmp <- olap %>% filter(biodom == bd$bd[i]) 
+  
+  p = ggplot(tmp, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        geom_text(aes(label = intersect ), size = 2.5) +
+        facet_wrap(~kappa, scales = 'free', ncol =1)+
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd$bd[i],
+             subtitle = 'Terms in sub-domain vs\nclusters of annotation network, filtered by edge kappa')
+      
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+### by biodomain, genes {.tabset}
+cluster sub-networks defined by biological domain annotation   
+```{r}
+biodom.nw.bd.subclusters <- tibble()
+
+for(j in c(0.3, 0.5, 0.7, 0.9, 0.95)){
+  
+  red.biodom.nw <- delete.edges(biodom.nw, E(biodom.nw)[E(biodom.nw)$kappa < j])
+
+  x <- tibble(
+    bd = vertex_attr_names(red.biodom.nw)[9:27],
+    kappa = j,
+    n_subclust = NA_real_,
+    subclust = list(NA)
+  )
+  
+  for(i in 1:nrow(x)){
+    rm_idx <- which( vertex_attr(red.biodom.nw, x$bd[i]) != 1 ) 
+    tmp <- delete_vertices( red.biodom.nw, rm_idx )
+    subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+    x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+      left_join(., biodom %>% select(id = GO_ID, GOterm_Name, n_symbol, symbol), by = 'id') %>% 
+      filter(!is.na(GOterm_Name)) %>% 
+      group_by(clust) %>% 
+      arrange(desc(n_symbol), .by_group = T) %>% 
+      ungroup()
+    x$n_subclust[i] <- x$subclust[[i]]$clust %>% unique %>% length
+  }
+  
+  biodom.nw.bd.subclusters <- bind_rows(biodom.nw.bd.subclusters, x)
+  
+}
+
+```
+
+```{r message=FALSE}
+bd = biodom.nw.bd.subclusters %>% select(bd, kappa) %>% 
+  filter(bd %in% subdom$Biodomain)
+
+olap = tibble()
+
+for(i in 1:nrow(bd)) {
+  
+  x = bd$bd[i]
+  k = bd$kappa[i]
+  
+  sd = subdom %>% filter(Biodomain == x) %>% 
+    group_by(Subdomain) %>% 
+    mutate(sub_dom = GOterm_Name[TopSD == 1]) %>% 
+    left_join(., biodom %>% select(GO_ID, symbol), by = 'GO_ID' ) %>% 
+    unnest(symbol) %>% 
+    group_by(Biodomain, Subdomain) %>% 
+    summarise(symbol = symbol %>% unique() %>% list())
+  
+  lc = biodom.nw.bd.subclusters %>% filter(bd == x, kappa == k)
+  
+  if( nrow(lc$subclust[[1]]) == 0 ){ next }
+  
+  lc = lc %>% pull(subclust) %>% .[[1]] %>% 
+    group_by(clust) %>% 
+    summarise(symbol = unlist(symbol) %>% unique() %>% list())
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$Subdomain) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length(),
+      n_b = sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique(),
+             sd %>% filter( Subdomain == as.numeric(b) ) %>% pull(symbol) %>% unlist() %>% unique()
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b),
+      biodom = x,
+      kappa = k
+    ) %>% 
+    bind_rows(olap, .)
+}
+
+```
+
+
+Compare with sub-domain annotations from Jesse  
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=5, fig.height=12}
+
+bd = biodom.nw.bd.subclusters %>% select(bd) %>% 
+  filter(bd %in% subdom$Biodomain) %>% 
+  distinct()
+
+for(i in 1:nrow(bd)) {
+
+  cat("  \n####",  bd$bd[i], "  \n")
+
+  tmp <- olap %>% filter(biodom == bd$bd[i]) 
+  
+  p = ggplot(tmp, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        geom_text(aes(label = intersect ), size = 2.5) +
+        facet_wrap(~kappa, scales = 'free', ncol =1)+
+        labs(x='Louvian Cluster',y='Sub-domain',
+             title = bd$bd[i],
+             subtitle = 'Genes in sub-domain vs\nclusters of annotation network, filtered by edge kappa')
+      
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+# Biodomain NW louvian clustering
+Pull Rohit's communities from synapse  
+```{r message=FALSE}
+synLogin()
+
+synID <- 'syn52223172'
+synDir <- synGetChildren(synID)$asList() %>% tibble(f = .) %>% unnest_wider(f) %>% mutate(parent = synID)
+synDir <- map_dfr(
+  1:nrow(synDir),
+  ~ synGetChildren(synDir$id[.x])$asList() %>% tibble(f = .) %>% unnest_wider(f) %>% mutate(parent = synDir$name[.x])
+  ) %>% 
+  mutate(bd_abbr = str_split_fixed(name, '_', 2) %>% .[,1]) 
+
+x = tibble( biodom = biodom$Biodomain %>% unique() %>% sort() %>% str_subset('DNA Repair', negate = T), 
+            bd_abbr = synDir$bd_abbr %>% unique)
+
+synDir <- left_join(synDir, x, by = 'bd_abbr') %>% 
+  select(biodom, name, id) %>% 
+  rowwise() %>% 
+  mutate(
+    graph = synGet(id) %>% .$path %>% read.graph(., format = 'graphml') %>% list(),
+    nodes = tibble( na = vertex.attributes(graph) ) %>% 
+      t() %>% as_tibble(rownames = NA, .name_repair = 'unique') %>% unnest(everything()) %>%
+      rename_with(., ~names(vertex.attributes(graph)), everything()) %>% list()
+      # V(.) %>% names() %>% list()
+  ) %>% 
+  select(-graph)
+
+nw.clust <- synDir; rm(synDir, synID)
+```
+
+## between cluster overlap   
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=15, fig.height=12 }
+
+bd <- nw.clust$biodom %>% unique %>% sort
+olap = tibble()
+for(i in 1:length(bd)) {
+  # cat("  \n###",  bd[i], "  \n")
+  
+  tmp <- nw.clust %>% filter(biodom == bd[i])
+  
+  olap <- crossing(c = tmp$name, b = tmp$name) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = tmp %>% filter(name == c) %>% pull(nodes) %>% .[[1]] %>% nrow() ,
+      n_b = tmp %>% filter(name == b) %>% pull(nodes) %>% .[[1]] %>% nrow() 
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             tmp %>% filter(name == c) %>% pull(nodes) %>% .[[1]] %>% .$name,
+             tmp %>% filter(name == b) %>% pull(nodes) %>% .[[1]] %>% .$name
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = str_remove_all(c, '.graphml'),
+      c = fct_reorder( as.factor(c), n_c),
+      b = str_remove_all(b, '.graphml'),
+      b = fct_reorder( as.factor(b), n_b),
+      bd = bd[i]
+    ) %>% 
+    bind_rows(olap,.)
+  }
+
+```
+
+```{r fig.width=12, fig.height=10}
+ggplot(olap, aes(x = c, y = b)) +
+  geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+  # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+  viridis::scale_fill_viridis("% x", option = "C", direction = -1)+
+  # scale_x_discrete(position = "top") +
+  geom_text(aes(label = intersect ), size = 2.5) +
+  facet_wrap(~bd, scales = 'free')
+```
+
+## comparison with sub-domains {.tabset}
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=16, fig.height=6}
+
+bd <- nw.clust$biodom %>% unique %>% sort %>% 
+  .[. %in% subdom$Biodomain]
+
+# olap = tibble()
+
+for(i in 1:length(bd)) {
+  cat("  \n###",  bd[i], "  \n")
+  
+  sd = subdom %>% filter(Biodomain == bd[i]) %>% 
+    group_by(Subdomain) %>% 
+    mutate(sub_dom = GOterm_Name[TopSD == 1]) %>% 
+    left_join(., biodom %>% select(GO_ID, symbol), by = 'GO_ID' ) %>% 
+    unnest(symbol) %>% 
+    group_by(Biodomain, Subdomain) %>% 
+    summarise(genes = symbol %>% unique() %>% list())
+
+  lc = nw.clust %>% filter(biodom ==  bd[i])
+  
+  olap <- crossing(c = lc$name, b = sd$Subdomain) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter(name == c) %>% pull(nodes) %>% .[[1]] %>% nrow() ,
+      n_b = sd %>% filter(Subdomain == b) %>% pull(genes) %>% unlist() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter(name == c) %>% pull(nodes) %>% .[[1]] %>% .$name,
+             sd %>% filter(Subdomain == b) %>% pull(genes) %>% unlist()
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = str_remove_all(c, '.graphml'),
+      c = fct_reorder( as.factor(c), n_c),
+      b = str_remove_all(b, '.graphml'),
+      b = fct_reorder( as.factor(b), n_b)
+    ) 
+  
+    p = cowplot::plot_grid(
+    
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain'),
+      
+      ggplot(olap, aes(x = c, y = b)) +
+        geom_tile(aes(fill=pct_c), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        # theme(axis.text.x = element_blank(), legend.position = 'bottom') +
+        # scale_fill_gradient2('% Total', low = 'white', high = '4a66ac', na.value = 'grey90') +
+        viridis::scale_fill_viridis("% Cluster", option = "C", direction = -1)+
+        # scale_x_discrete(position = "top") +
+        geom_text(aes(label = intersect ), size = 2.5) +
+        labs(x='Louvian Cluster',y='Sub-domain'),
+      
+      nrow = 1
+      )
+
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+  }
+
+```
+
+## comparison with term NW based clusters {.tabset}
+```{r}
+biodom.nw.bd.subclusters <- tibble()
+
+for(j in c(0.3, 0.5, 0.7, 0.9, 0.95)){
+  
+  red.biodom.nw <- delete.edges(biodom.nw, E(biodom.nw)[E(biodom.nw)$kappa < j])
+
+  x <- tibble(
+    bd = vertex_attr_names(red.biodom.nw)[9:27],
+    kappa = j,
+    n_subclust = NA_real_,
+    subclust = list(NA)
+  )
+  
+  for(i in 1:nrow(x)){
+    rm_idx <- which( vertex_attr(red.biodom.nw, x$bd[i]) != 1 ) 
+    tmp <- delete_vertices( red.biodom.nw, rm_idx )
+    subclust <- igraph::cluster_louvain(tmp, weights = E(tmp)$kappa )
+    x$subclust[[i]] <- tibble( id = subclust$names, clust = subclust$membership ) %>% 
+      left_join(., biodom %>% select(id = GO_ID, GOterm_Name, n_symbol, symbol), by = 'id') %>% 
+      filter(!is.na(GOterm_Name)) %>% 
+      group_by(clust) %>% 
+      arrange(desc(n_symbol), .by_group = T) %>% 
+      ungroup()
+    x$n_subclust[i] <- x$subclust[[i]]$clust %>% unique %>% length
+  }
+  
+  biodom.nw.bd.subclusters <- bind_rows(biodom.nw.bd.subclusters, x)
+  
+}
+
+```
+
+
+```{r message=FALSE}
+bd = biodom.nw.bd.subclusters %>% select(bd, kappa) %>% 
+  filter(bd %in% subdom$Biodomain)
+
+olap = tibble()
+
+for(i in 1:nrow(bd)) {
+  
+  x = bd$bd[i]
+  k = bd$kappa[i]
+  
+  sd = nw.clust %>% filter(biodom ==  x) %>% 
+    mutate(clust = str_remove_all(name, '.graphml') ) 
+  
+  lc = biodom.nw.bd.subclusters %>% filter(bd == x, kappa == k)
+  
+  if( nrow(lc$subclust[[1]]) == 0 ){ next }
+  
+  lc = lc %>% pull(subclust) %>% .[[1]] %>% 
+    group_by(clust) %>% 
+    summarise(symbol = unlist(symbol) %>% unique() %>% list())
+  
+  olap <- crossing(c = unique(lc$clust), b = unique(sd$clust) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique() %>% length(),
+      n_b = sd %>% filter( clust == b ) %>% pull(nodes) %>% .[[1]] %>% pull(name) %>% unique() %>% length()
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             lc %>% filter( clust == as.numeric(c) ) %>% pull(symbol) %>% unlist() %>% unique(),
+             sd %>% filter( clust == b ) %>% pull(nodes) %>% .[[1]] %>% pull(name)
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = fct_reorder( as.factor(c), n_c),
+      b = fct_reorder( as.factor(b), n_b),
+      biodom = x,
+      kappa = k
+    ) %>% 
+    bind_rows(olap, .)
+  
+}
+
+```
+
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=5, fig.height=12}
+
+bd = biodom.nw.bd.subclusters %>% select(bd) %>% 
+  distinct()
+
+for(i in 1:nrow(bd)) {
+
+  cat("  \n####",  bd$bd[i], "  \n")
+
+  tmp <- olap %>% filter(biodom == bd$bd[i]) 
+  
+  if(nrow(tmp) == 0){next}
+  
+  p = ggplot(tmp, aes(y = c, x = b)) +
+        geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+        viridis::scale_fill_viridis("% Subdomain", option = "C", direction = -1)+
+        geom_text(aes(label = intersect ), size = 2.5) +
+        facet_wrap(~kappa, scales = 'free', ncol =1)+
+        labs(y='Annotation NW Clusters',x='Path Commons NW Clusters',
+             title = bd$bd[i],
+             subtitle = 'Genes in Pathway Commons NW clusters vs\nannotation network clusters, filtered by edge kappa')
+      
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
+
+```
+
+## term enrichment by clustered nodes {.tabset}
+```{r}
+univ <-as.data.frame(org.Hs.eg.db::org.Hs.egGO) %>%
+  pull(gene_id) %>%
+  unique() %>%
+  gprofiler2::gconvert(., organism = 'hsapiens', target = 'HGNC', numeric_ns = 'ENTREZGENE_ACC') %>% 
+  as_tibble() %>% 
+  pull('name') %>%
+  intersect(., names(V(base.net)) )
+
+nw.clust <- nw.clust %>%
+  rename(bd = biodom) %>% 
+  rowwise() %>%
+  mutate(
+    gl = nodes %>% .[[2]] %>% list(),
+    enr = gprofiler2::gost( query = unlist(gl),
+                            organism = 'hsapiens',
+                            domain_scope = 'custom',
+                            custom_bg = univ,
+                            sources = 'GO',
+                            significant = FALSE
+                            ) %>%
+      .$result %>%
+      list()) 
+
+nw.clust <- nw.clust %>%
+  rowwise() %>% 
+  mutate(
+    enr = anno.enr(enr,
+                   GO_ID_column = 'term_id',
+                   biodomain_table = biodom,
+                   domain_colors = biodom %>%
+                     select(domain = Biodomain, abbr:color) %>%
+                     distinct()
+                   ) %>%
+      list()
+  )
+
+```
+
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=6, fig.height=16}
+
+bd <- nw.clust$bd %>% unique %>% sort 
+
+# olap = tibble()
+thresh = 1e-2
+
+for(i in 1:length(bd)) {
+  
+  cat("  \n###",  bd[i], "  \n")
+  
+  # subset to biodomain
+  tmp <- nw.clust %>% 
+    rename(biodom = bd) %>% 
+    rowwise() %>% 
+    mutate(
+      name = name %>% str_remove_all('.graphml'),
+      name = paste0(name, ', ', length(unlist(unique(nodes))), ' nodes')
+    ) %>% 
+    filter(biodom == bd[i]) %>% 
+    unnest(enr) 
+  
+  # tally biodom term enrichments
+  bdt <- bd.tally(tmp %>% filter(p_value <= thresh) %>% pull(term_name), biodom)
+  tmp = tmp %>%
+    mutate(
+      Biodomain = factor(Biodomain,
+                         levels = bdt$domain %>% 
+                           str_subset('none', negate = T) %>%
+                           c('none',.))
+      )
+  
+  # biodom plot
+  p1 = tmp %>%
+    ggplot(aes(-log10(p_value), Biodomain))+
+    geom_violin(data = subset(tmp, p_value <= thresh), aes(color = color), scale = 'width')+
+    geom_jitter(data = subset(tmp, p_value <= thresh), aes(color = color), alpha = .7)+
+    scale_color_identity()+
+    # xlim(c(0,30))+
+    labs(y = '', 
+         title = paste0(bd[i], ' cluster enriched terms'), 
+         subtitle = paste0('enrichment threshold: ', thresh))+
+    facet_wrap(~name, ncol = 3) # , scales = 'free_x'
+  
+  # compute term overlap
+  olap <- crossing( c = unique(tmp$name), b = unique(tmp$name) ) %>% 
+    rowwise() %>% 
+    mutate(
+      n_c = tmp %>% filter(name == c, p_value <= thresh) %>% 
+        pull(GO_ID) %>% unique %>% length ,
+      n_b = tmp %>% filter(name == b, p_value <= thresh) %>% 
+        pull(GO_ID) %>% unique %>% length 
+    ) %>% 
+    group_by(c,b) %>% 
+    mutate(.keep = 'all', 
+           intersect = length(intersect(
+             tmp %>% filter(name == c, p_value <= thresh) %>% pull(GO_ID),
+             tmp %>% filter(name == b, p_value <= thresh) %>% pull(GO_ID)
+             ))
+           ) %>% 
+    ungroup() %>% 
+    rowwise() %>% 
+    mutate(.keep = 'all', 
+           pct_c = intersect / n_c,
+           pct_b = intersect / n_b ) %>%
+    ungroup() %>% 
+    mutate(
+      c = str_remove_all(c, '.graphml'),
+      c = fct_reorder( as.factor(c), n_c),
+      b = str_remove_all(b, '.graphml'),
+      b = fct_reorder( as.factor(b), n_b)
+    ) 
+  
+  # plot heatmap of term overlap
+  p2 = ggplot(olap, aes(x = c, y = b)) +
+    geom_tile(aes(fill=pct_b), alpha = .8) + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    viridis::scale_fill_viridis("% Terms Shared", option = "C", direction = -1)+
+    geom_text(aes(label = intersect ), size = 2.5) +
+    scale_x_discrete(limits = rev)+
+    labs(x='',y='',
+         title = paste0(bd[i], ': enriched GO terms overlap across clusters'),
+         subtitle = paste0('enrichment threshold: ', thresh)
+         )
+  
+  p = cowplot::plot_grid(p2, p1, ncol = 1, rel_heights = c(.5,1))
+  
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+  }
+
+```
+
+
+# Session
+```{r}
+sessionInfo()
+```
+

@@ -161,16 +161,36 @@ cat('Number of queried genes to trace: ',
 cat('\n','Beginning trace... \n')
 Sys.time()
 
+# calculate edge weights for Dijkstra
+edges <- e_info(nw)
+verts <- v_info(nw)
+
+node_weights = verts %>% 
+  select(name, trs = TargetRiskScore) %>% 
+  mutate(trs = if_else(is.nan(trs), 0, trs)) 
+
+edge_weights = edges %>% 
+  select(edge) %>% distinct() %>% 
+  mutate(head = str_split_fixed(edge, ':',2)[,1], 
+         tail = str_split_fixed(edge, ':',2)[,2]) %>% 
+  left_join(., node_weights %>% select(head = name, h.trs = trs)) %>% 
+  left_join(., node_weights %>% select(tail = name, t.trs = trs)) %>% 
+  mutate(weight = h.trs+t.trs)
+
 ##
 # trace paths in parallel
+snw <- igraph::simplify(nw, remove.multiple = T)
+
 future::plan(strategy = 'multisession', workers = 10)
 trace <- furrr::future_map(
   input.gene.list,
   ~ short_paths(
-    tnet = nw,
+    tnet = snw,
     target = .x,
     targets = input.gene.list,
     sentinals = input.gene.list,
+    edge_weights = NULL, # conduct a breadth first search
+    # edge_weights = edge_weights$weight, # or specify weights based on scores to perform Dijkstra's algorithm
     cores = 1)
 )
 future::plan(strategy = 'sequential')
@@ -186,10 +206,10 @@ trace.nw <- igraph::induced_subgraph(
 
 ##
 # Annotate nodes that are queried or added by trace
-x = tibble( node = V(trace.nw) %>% names ) %>% 
+status = tibble( node = V(trace.nw) %>% names ) %>% 
   mutate( node_status = if_else(node %in% input.gene.list, 'query', 'added') )
 
-igraph::vertex_attr(trace.nw, 'node_status', index = igraph::V(trace.nw)) <- x$node_status
+igraph::vertex_attr(trace.nw, 'node_status', index = igraph::V(trace.nw)) <- status$node_status
 
 ##
 # save NW trace and filtered NW
@@ -201,103 +221,103 @@ igraph::write_graph(
   format = "graphml"
 )
 
-##
-# Remove redundant edges
-nw.simple <- igraph::simplify(
-  trace.nw,
-  remove.multiple = TRUE,
-  remove.loops = FALSE,
-  edge.attr.comb = list( 
-    interaction = 'concat',
-    edge = 'random',
-    occurrance = 'concat',
-    n_edge = 'max',
-    n_edge_types = 'max',
-    n_edge_evidence = 'max',
-    n_source = 'max',
-    sources = 'concat',
-    n_evidence = 'sum',
-    evidence_pmid = 'concat',
-    n_pathways = 'max',
-    pathway_names = 'concat',
-    directed = 'max'
-  )
-)
+# ##
+# # Remove redundant edges
+# nw.simple <- igraph::simplify(
+#   trace.nw,
+#   remove.multiple = TRUE,
+#   remove.loops = FALSE,
+#   edge.attr.comb = list( 
+#     interaction = 'concat',
+#     edge = 'random',
+#     occurrance = 'concat',
+#     n_edge = 'max',
+#     n_edge_types = 'max',
+#     n_edge_evidence = 'max',
+#     n_source = 'max',
+#     sources = 'concat',
+#     n_evidence = 'sum',
+#     evidence_pmid = 'concat',
+#     n_pathways = 'max',
+#     pathway_names = 'concat',
+#     directed = 'max'
+#   )
+# )
 
 cat('\n','Trace complete and networks saved. \n')
 Sys.time()
 
-# generate plots ----------------------------------------------------------
-
-cat('\n\nGenerating plots...\n')
-
-# calculate network stats
-nw.stats <- tibble(  
-  network = c('full','pre-trace','traced','simplified'),
-  n_nodes = c( 
-    net %>% V %>% length,
-    nw %>% V %>% length,
-    trace.nw %>% V %>% length,
-    nw.simple %>% V %>% length
-    ),
-  n_edges = c(
-    net %>% E %>% length,
-    nw %>% E %>% length,
-    trace.nw %>% E %>% length,
-    nw.simple %>% E %>% length
-    ),
-  avg_path_length = c(
-    net %>% average.path.length, 
-    nw %>% average.path.length, 
-    trace.nw %>% average.path.length, 
-    nw.simple %>% average.path.length
-    ),
-  assortativity_coef = c(
-    net %>% assortativity(., types1 = V(.)),
-    nw %>% assortativity(., types1 = V(.)),
-    trace.nw %>% assortativity(., types1 = V(.)),
-    nw.simple %>% assortativity(., types1 = V(.))
-    ),
-  connected_components = c(
-    net %>% no.clusters, 
-    nw %>% no.clusters,
-    trace.nw %>% no.clusters, 
-    nw.simple %>% no.clusters
-    )
-)
-
-write_csv(nw.stats,
-          paste0( full_path, '/',
-                  working_path, directionality, filt,
-                  '_netStats.csv' )
-          )
-
-# plot network stats
-nw.stats %>% 
-  pivot_longer(cols = -network, names_to = 'properties', values_to = 'val') %>% 
-  mutate(properties = factor(properties, 
-                             levels = c('n_nodes',
-                                        'n_edges', 
-                                        'avg_path_length',
-                                        'assortativity_coef',
-                                        'connected_components')) 
-         , network = factor(network, levels = c('full',
-                                                'pre-trace',
-                                                'traced',
-                                                'biodom_filtered',
-                                                'simplified'))) %>% 
-  ggplot(aes(network, val)) +
-  geom_bar(stat = 'identity', position = 'dodge')+
-  theme(legend.position = 'top',
-        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+
-  labs(y = '',x = '', subtitle = 'base network properties')+
-  facet_wrap(~properties, scales = 'free_y', ncol = 2)
-
-ggsave(
-  paste0( full_path, '/',
-          working_path, directionality, filt,
-          '_netStats.pdf' )
-)
+# # generate plots ----------------------------------------------------------
+# 
+# cat('\n\nGenerating plots...\n')
+# 
+# # calculate network stats
+# nw.stats <- tibble(  
+#   network = c('full','pre-trace','traced','simplified'),
+#   n_nodes = c( 
+#     net %>% V %>% length,
+#     nw %>% V %>% length,
+#     trace.nw %>% V %>% length,
+#     nw.simple %>% V %>% length
+#     ),
+#   n_edges = c(
+#     net %>% E %>% length,
+#     nw %>% E %>% length,
+#     trace.nw %>% E %>% length,
+#     nw.simple %>% E %>% length
+#     ),
+#   avg_path_length = c(
+#     net %>% average.path.length, 
+#     nw %>% average.path.length, 
+#     trace.nw %>% average.path.length, 
+#     nw.simple %>% average.path.length
+#     ),
+#   assortativity_coef = c(
+#     net %>% assortativity(., types1 = V(.)),
+#     nw %>% assortativity(., types1 = V(.)),
+#     trace.nw %>% assortativity(., types1 = V(.)),
+#     nw.simple %>% assortativity(., types1 = V(.))
+#     ),
+#   connected_components = c(
+#     net %>% no.clusters, 
+#     nw %>% no.clusters,
+#     trace.nw %>% no.clusters, 
+#     nw.simple %>% no.clusters
+#     )
+# )
+# 
+# write_csv(nw.stats,
+#           paste0( full_path, '/',
+#                   working_path, directionality, filt,
+#                   '_netStats.csv' )
+#           )
+# 
+# # plot network stats
+# nw.stats %>% 
+#   pivot_longer(cols = -network, names_to = 'properties', values_to = 'val') %>% 
+#   mutate(properties = factor(properties, 
+#                              levels = c('n_nodes',
+#                                         'n_edges', 
+#                                         'avg_path_length',
+#                                         'assortativity_coef',
+#                                         'connected_components')) 
+#          , network = factor(network, levels = c('full',
+#                                                 'pre-trace',
+#                                                 'traced',
+#                                                 'biodom_filtered',
+#                                                 'simplified'))) %>% 
+#   ggplot(aes(network, val)) +
+#   geom_bar(stat = 'identity', position = 'dodge')+
+#   theme(legend.position = 'top',
+#         axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+
+#   labs(y = '',x = '', subtitle = 'base network properties')+
+#   facet_wrap(~properties, scales = 'free_y', ncol = 2)
+# 
+# ggsave(
+#   paste0( full_path, '/',
+#           working_path, directionality, filt,
+#           '_netStats.pdf' )
+# )
 
 # # synapse upload ----------------------------------------------------------
 # 
