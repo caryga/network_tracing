@@ -63,75 +63,69 @@ e_info <- function(net){
 
 ```
 
-KDA result data  
+read KDA result data  
 ```{r}
-# remote from synase
-read_kd_remote <- function(kda_dir_syn_id){
+read_kd <- function(path){
   
-  synDir <- synGetChildren(kda_dir_syn_id)$asList() %>%
-  tibble(f = .) %>% unnest_wider(f)
-  
-  kd.ef0 = synDir %>% 
-    filter( grepl('edgeFactor_0.results', name) ) %>% pull(id) %>% 
-    synGet(.) %>% .$path %>% read_tsv(., col_types = cols())
-
-  ef0.top = synDir %>% 
-    filter( grepl('edgeFactor_0.tophits', name) ) %>% pull(id) %>% 
-    synGet(.) %>% .$path %>% read_tsv(., col_types = cols())
-  
-  kd.ef1 = synDir %>% 
-    filter( grepl('edgeFactor_1.results', name) ) %>% pull(id) %>% 
-    synGet(.) %>% .$path %>% read_tsv(., col_types = cols())
-  
-  ef1.top = synDir %>% 
-    filter( grepl('edgeFactor_1.tophits', name) ) %>% pull(id) %>% 
-    synGet(.) %>% .$path %>% read_tsv(., col_types = cols())
-  
-  kd = bind_rows(
-    kd.ef1 %>% 
-      mutate( 
-        ef = 'ef1',
-        top_kd = if_else(paste0(NODE,MODULE) %in% paste0(ef1.top$NODE,ef1.top$MODULE), T, F)
-        ) ,
-    kd.ef0 %>% 
-      mutate( 
-        ef = 'ef0',
-        top_kd = if_else(paste0(NODE,MODULE) %in% paste0(ef0.top$NODE,ef0.top$MODULE), T, F)
-        )
-    ) %>% 
-    mutate(FDR = -log10(FDR)) %>% 
-    pivot_wider(id_cols = c(MODULE,NODE,MEMBER), 
-                values_from = c(FDR, top_kd), 
-                names_from = ef) %>% 
-    mutate(
-      across(contains('FDR'), ~if_else(is.na(.x), 0, .x)),
-      delta_fdr = FDR_ef1 - FDR_ef0,
-      top_kd = case_when(top_kd_ef1 & top_kd_ef0 ~ 'both',
-                            top_kd_ef1 &! top_kd_ef0 ~ 'ef1',
-                            top_kd_ef0 &! top_kd_ef1 ~ 'ef0',
-                            T ~ 'neither')
-      ) 
-  
-  return(kd)
-  
-  }
-
-# local directory
-read_kd_local <- function(local_path){
-  
-  kd.pth <- list.files(local_path, full.names = T)
-  
-  kd.ef0 <- read_tsv(
-    kd.pth %>% str_subset('_0.results.txt'), 
-    col_types = cols())
-  kd.ef1 <- read_tsv(
-    kd.pth %>% str_subset('_1.results.txt'),  
-    col_types = cols())
-  kd.top <- read_tsv(
-    kd.pth %>% str_subset('_1.tophits.txt'), 
-    col_types = cols()) %>% 
-    mutate(kd = paste0(NODE,'-',MODULE))
+  # detect if KDA dir path is on synapse
+  if(substr(path,1,3) == 'syn'){
+        
+    synDir <- synGetChildren(path)$asList() %>%
+      tibble(f = .) %>% unnest_wider(f)
     
+    res <- synDir %>% filter(grepl('edgeFactor', name)) %>% pull(name)
+    
+    if( length(res) < 10 ){ 
+      simpleError('Not a full KD results set')
+      return(NULL)
+      }
+    
+    kd.ef0 <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_0.results.txt', name) ) %>% pull(id)
+        )$path, 
+        col_types = cols())
+    ef0.top <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_0.tophits.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+    
+    kd.ef1 <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_1.results.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols())
+    ef1.top <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_1.tophits.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+  
+  # or read from a local path
+  } else {
+    
+    kd.pth <- list.files(path, full.names = T)
+  
+    kd.ef0 <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_0.results.txt'), 
+      col_types = cols())
+    kd.top <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.tophits.txt'), 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+    kd.ef1 <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.results.txt'),  
+      col_types = cols())
+    kd.top <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.tophits.txt'), 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+  }
+    
+  # Join up the results
   kd = bind_rows(
     kd.ef0 %>% mutate(ef = 'ef0_fdr'),
     kd.ef1 %>% mutate(ef = 'ef1_fdr')
@@ -140,10 +134,14 @@ read_kd_local <- function(local_path){
     pivot_wider(id_cols = c(MODULE, NODE, MEMBER), 
                 names_from = ef, values_from = FDR, values_fill = 0) %>%
     mutate(delta_fdr = ef1_fdr - ef0_fdr) %>% arrange(desc(delta_fdr)) %>% 
-    mutate(top = 0)
+    mutate(top = 0, top_ef0 = 0)
   
-  if( any( kd.top$FDR < 0.05 ) ){
-    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% kd.top$kd[kd.top$FDR < 0.05]) ] <- 1
+  # Indicate which driver-module pairs are top for each analysis
+  if( any( ef1.top$FDR < 0.05 ) ){
+    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% ef1.top$kd[ef1.top$FDR < 0.05]) ] <- 1
+  }
+  if( any( ef0.top$FDR < 0.05 ) ){
+    kd$top_ef0[ which(paste0(kd$NODE,'-',kd$MODULE) %in% ef0.top$kd[ef0.top$FDR < 0.05]) ] <- 1
   }
   
   return(kd)
@@ -241,6 +239,11 @@ scores <- read_csv(
 omics <- read_csv(
   synTableQuery('select * from syn22758536', includeRowIdAndRowVersion = F)$filepath
   , col_types = cols())
+npath <- read_csv(
+  synTableQuery('select * from syn32288310', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+agora <- read_csv(synGet('syn12540368')$path, quote = '"', col_types = cols())
 
 # biological domain annotations
 biodom <- full_join(
@@ -255,8 +258,9 @@ biodom <- full_join(
 domains = biodom %>% pull(Biodomain) %>% unique() %>% sort()
 
 # enriched biodomain terms
-enr.bd <- read_csv( synGet('syn45824995')$path, col_types = cols() ) %>% 
-  mutate(leadingEdge_genes = str_split(leadingEdge_genes, '\\|'))
+enr.bd <- synGet('syn52749187') %>% .$path %>% readRDS() %>% 
+  filter(score == 'Overall') %>% select(anno) %>% unnest(anno) %>% 
+  mutate(leadingEdge_genes = str_split(core_enrichment, '\\|'))
 
 # base network
 base_net <- igraph::read_graph(synGet('syn51110930')$path, format = 'graphml') 
@@ -338,37 +342,44 @@ simple <- tibble(expt = simple$expt %>% unique() %>% sort(),
 
 read results from synapse  
 ```{r}
-# top level subdom directory
 synLogin()
-subdoms <- synGetChildren('syn52314422')$asList() %>%
-  tibble(f = .) %>% unnest_wider(f) %>%
+
+subdoms  <-  read_syn_dir('syn52314422') %>%  # biodomain
+  filter(grepl('Folder', type)) %>% 
   select(bd = name, bd_id = id) %>% 
   rowwise() %>% 
-  mutate(
-    subdoms = synGetChildren( parent = bd_id )$asList() %>% 
-      tibble(f = .) %>% unnest_wider(f) %>% list()
-    ) %>% 
-  unnest(subdoms) %>% 
-  select(bd, sd = name, id) %>% 
+  mutate( sd = read_syn_dir(bd_id) %>% list() ) %>% 
+  unnest(sd) %>% 
+  select(bd, bd_id, sd = name, sd_id = id) %>% 
   rowwise() %>% 
   mutate(
-    nw.dir = synGetChildren(  parent = id  )$asList() %>%
-      tibble(f = .) %>% unnest_wider(f) %>% list()
-  )
+    nw.dir = read_syn_dir(sd_id) %>% list()
+    )
 ```
 
-NW data
-NW data
 ```{r}
 nw.dat = subdoms %>% select(bd, sd, nw.dir) %>% 
-  unnest(nw.dir) %>% filter(grepl('bdFiltered.+graphml',name)) %>%
-  select(bd,sd,id)
+  unnest(nw.dir) %>% filter(grepl('graphml',name)) %>%
+  mutate(filt = if_else(grepl('bdFilt',name), 'bd.filt','full')) %>% 
+  select(bd,sd,id,filt) %>% 
+  pivot_wider(names_from=filt, values_from = id)
 
-future::plan('multisession')
+# query genes
+nw.dat$q_genes <- map(
+  1:nrow(nw.dat),
+  ~ subdoms$nw.dir[[.x]] %>% filter( grepl('queryList', name) ) %>% 
+    pull(id) %>% synGet(.) %>% .$path %>% 
+    read_tsv(., col_names = F, col_types = cols()) %>% 
+    pull(X1) 
+)
+
+# BD filtered NW stats
+# future::plan('multisession')
 x = furrr::future_map_dfr(
-  nw.dat$id,
+  1:nrow(nw.dat),
   ~{synLogin()
-    nw = synGet(.x) %>% .$path %>% read_graph(., format = 'graphml')
+    nw = synGet(nw.dat$bd.filt[.x]) %>% .$path %>% 
+      read_graph(., format = 'graphml')
     snw = igraph::simplify(nw, remove.multiple = T)
     tibble(
       avg_node_degree = degree(snw, V(snw)) %>% mean(),
@@ -380,17 +391,12 @@ x = furrr::future_map_dfr(
     )
   }
 )
-future::plan('sequential')
+# future::plan('sequential')
 
-nw.dat = bind_cols(nw.dat, x)
-
-nw.dat$q_genes <- map(
-  1:nrow(subdoms),
-  ~ subdoms$nw.dir[[.x]] %>% filter( grepl('queryList', name) ) %>% 
-    pull(id) %>% synGet(.) %>% .$path %>% 
-    read_tsv(., col_names = F, col_types = cols()) %>% 
-    pull(X1) 
-)
+nw.dat = bind_rows(
+  bind_cols(nw.dat, x) %>% mutate(filt = 'bd.filt')
+  # , bind_cols(nw.dat, y) %>% mutate(filt = 'full')
+); #rm(x,y)
 
 nw.dat$input = map(
   1:nrow(nw.dat),
@@ -411,39 +417,35 @@ nw.dat$edges = map(
   1:nrow(nw.dat),
   ~ nw.dat$edge_t[[.x]] %>% pull(edge) %>% unique() %>% list()
 )
+
+nw.dat <- relocate(nw.dat, filt, .after = 'bd.filt')
+nw.dat <- relocate(nw.dat, q_genes, .after = 'node_t')
 ```
 
 # KD Modules in Graphs
-Compare the distributions between filtered base network and traced network  
+Compare the distributions between filtered base network and traced subdomain networks  
 ```{r}
-modules <- biodom %>% 
-  select(Biodomain, GO_ID, GOterm_Name, symbol, n_symbol) %>% 
-  mutate(
-    path_commons = length( intersect( names(V(base_net)), symbol ) ),
-    node_filt = NA,#length( intersect( names(V(undir_node)), symbol ) ),
-    edge_filt = NA,#length( intersect( names(V(undir_edge)), symbol ) ),
-    node_edge_filt = length( intersect( names(V(undir_node_edge)), symbol ) )
+modules <- read_tsv(
+  here::here('results','subdomain',
+             'module_representation_across_networks.tsv'),
+  col_types = cols()
   )
 
-for(i in 1:nrow(nw.dat)){
-  x <- c()
-  for(j in 1:nrow(modules)){
-    x <- c(x,
-           length(intersect( nw.dat$nodes[[i]][[1]], modules$symbol[[j]] )) )
-  
-  }
-  modules <- tibble(x) %>% setNames( nw.dat$bd[i] ) %>% bind_cols(modules, .)
-}
-
 tmp <- modules %>% 
-  pivot_longer(cols = 10:ncol(modules)) %>% 
-  mutate( subdomain_nw = 100*(value / n_symbol),
-          base_nw = 100*(node_edge_filt / n_symbol) ) %>%
+  pivot_longer(cols = 7:ncol(modules)) %>% 
+  mutate( 
+    # biodom_nw = value
+    # , n_nw = (biodom_nw/100)*n_symbol
+    # , base_nw = node_edge_filt
+    
+    subdom_nw = 100*(value / n_symbol)
+    , base_nw = 100*(node_edge_filt / n_symbol)
+          ) %>%
   # left_join(., subdoms %>% select(bd, name = sd)) %>% 
-  rename(bd = name, n_nw = value) %>% 
-  pivot_longer(cols = c(subdomain_nw, base_nw)) %>% 
+  rename(sd = name, n_nw = value) %>% 
+  pivot_longer(cols = c(subdom_nw, base_nw)) %>% 
   rename(pct = value) %>% 
-  filter(n_nw >= 3, pct > 0) 
+  filter(n_nw >= 3, pct > 0)
 
 ```
 
@@ -454,17 +456,18 @@ ggplot(tmp, aes(pct) )+
        subtitle = 'distribution of all terms >0% and >=3 genes in each NW class')
 ```
 
-# Key Drivers
 
+# Key Drivers
 read & process KDs across biodomain NWs  
 ```{r warning=FALSE, message=FALSE}
 synLogin()
 
-kd <- map_dfr(
-  subdoms$sd,
+kd <- map2_dfr(
+  subdoms$bd, subdoms$sd,
   ~{
   # Get NW info
-  nodes <- subdoms %>% filter(sd == .x) %>% 
+  nodes <- subdoms %>% 
+    filter(bd == .x, sd == .y) %>% 
     pull(nw.dir) %>% .[[1]] %>% 
     filter(grepl('bdFilt.+graphml',name)) %>% 
     pull(id) %>% synGet(.) %>% .$path %>% 
@@ -476,6 +479,7 @@ kd <- map_dfr(
   nw_terms <- biodom %>% 
     filter(!is.na(n_symbol),n_symbol > 0) %>% 
     select(Biodomain, MODULE = GOterm_Name, NODE = symbol, n_symbol) %>% 
+    rowwise() %>% 
     mutate(
       n_nw = length( intersect( NODE, nodes$name ) ),
       pct_term = 100*(n_nw/n_symbol)
@@ -483,31 +487,48 @@ kd <- map_dfr(
     distinct()
   
   # get KDA results and annotate
-  kd.res <- subdoms %>% filter(sd == .x) %>% 
+  kd.res <- subdoms %>% 
+    filter(bd == .x, sd == .y) %>% 
     pull(nw.dir) %>% .[[1]] %>% filter(name == 'kda') %>% 
-    pull(id) %>% read_kd_remote(.)
+    pull(id) %>% read_kd(.)
   
-  kd.res <- kd.res %>% 
-    left_join(
-      ., nodes %>% select(NODE = name, n_nodes, node_status)
-    ) %>% 
-    left_join(
-      ., biodom %>% select(MODULE = GOterm_Name, Biodomain, abbr:color) 
-    ) %>% 
-    left_join(
-      ., nw_terms %>% select(MODULE, n_symbol:pct_term) %>% distinct()
-    ) %>% 
-    mutate(nw = .x)
+  if( is.null(kd.res) ){
+    
+    kd.res <- tibble(bd = .x, sd = .y)
+
+  } else {
+    
+    kd.res <- kd.res %>% 
+      left_join(
+        ., nodes %>% select(NODE = name, n_nodes, node_status)
+      ) %>% 
+      left_join(
+        ., biodom %>% select(MODULE = GOterm_Name, Biodomain, abbr:color) 
+      ) %>% 
+      left_join(
+        ., nw_terms %>% select(MODULE, n_symbol:pct_term) %>% distinct()
+      ) %>% 
+      mutate(bd = .x, sd = .y)
+
+    }
   
   return(kd.res)
+
   }
-)
+) %>% rowwise() %>% 
+  mutate(top_kd = case_when(
+    (top == 1 & top_ef0 == 1)~'both',
+    (top == 1 & top_ef0 == 0)~'ef1',
+    (top == 0 & top_ef0 == 1)~'ef0',
+    (top == 0 & top_ef0 == 0)~'neither',
+    )) 
 
 top.kd <- kd %>%
-  select(network = nw, n_nodes, kd_biodom = Biodomain,
+  select(bd, sd, #network = nw,
+         n_nodes, kd_biodom = Biodomain,
          MODULE:MEMBER, pct_term, n_symbol, n_nw,
          node_status, top_kd, contains('fdr'), color ) %>%
-  filter(FDR_ef1 > -log10(0.05), delta_fdr > 0, !(top_kd %in% c('ef0','neither')), pct_term > 50)
+  filter(ef1_fdr > -log10(0.05), delta_fdr > 0, !(top_kd %in% c('ef0','neither')), pct_term > 50)
 
 # kd %>%
 #   select(network = nw, n_nodes, kd_biodom = Biodomain,
@@ -521,112 +542,147 @@ top.kd <- kd %>%
 
 ```
 
-```{r fig.width=12, fig.height=15}
-tmp <- kd %>% 
-  left_join(., subdoms %>% select(nw=sd, bd)) %>% 
-  group_by(nw,Biodomain) %>% 
-  mutate(n_kd = length(unique(paste0(NODE,':',MODULE)))) %>% 
-  ungroup() %>% 
-  mutate(Biodomain = fct_reorder(Biodomain, n_kd),
-         nw = paste0(nw, '\n', n_nodes, ' nodes'), #str_replace_all(nw,'_','\n')
-         nw = fct_reorder(nw, desc(n_nodes) )) %>% 
-  arrange(Biodomain)
+## KD results per SD {.tabset}
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=12, fig.height=15}
+bd = kd$bd %>% unique()
+plot.new();dev.off()
 
-ggplot(tmp, aes(delta_fdr, Biodomain))+
-  geom_vline(xintercept = 0, lwd = 0.3)+
-  geom_jitter(data = subset(tmp, (top_kd %in% c('ef1','both') & 
-                                    FDR_ef1 > -log10(0.05) & 
-                                    delta_fdr > 0 & 
-                                    pct_term > 50)==F ), 
-              color = 'grey90', alpha = .1, size = .5, shape = 21)+
-  geom_jitter(data = subset(tmp, (top_kd %in% c('ef1','both') & 
-                                    FDR_ef1 > -log10(0.05) & 
-                                    delta_fdr > 0 & 
-                                    pct_term > 50)==T ), 
-              alpha = .5, shape = 21, color = 'grey30', aes(fill = color, size = FDR_ef1))+
-  geom_violin(data = subset(tmp, (top_kd %in% c('ef1','both') & 
-                                    FDR_ef1 > -log10(0.05) & 
-                                    delta_fdr > 0 & 
-                                    pct_term > 50)==T ),
-              aes(color = color), scale = 'width', alpha=.3, trim = T)+
-  labs(y = '', x = '\u0394 FDR, ef1 - ef0')+
-  # ggrepel::geom_label_repel(
-  #   data = subset(tmp, Biodomain == 'Structural Stabilization'),
-  #   aes(label = paste0(NODE, '\n', MODULE)), size = 2, alpha = .7,
-  #   max.overlaps = 100)+
-  facet_wrap(bd~nw, scale = 'free_x')+ 
-  theme(legend.position = 'top')+
-  scale_size_continuous('KDA FDR, -log10',  range = c(.5,3))+
-  scale_color_identity()+scale_fill_identity()
+for(i in bd){
+  
+  tmp <- kd %>% 
+    filter(bd == i) %>% 
+    rename(nw = sd) %>% 
+    left_join(., subdoms %>% select(nw=sd, bd)) %>% 
+    group_by(nw,Biodomain) %>% 
+    mutate(n_kd = length(unique(paste0(NODE,':',MODULE)))) %>% 
+    ungroup() %>% 
+    mutate(Biodomain = fct_reorder(Biodomain, n_kd),
+           nw = paste0(nw, '\n', n_nodes, ' nodes'), #str_replace_all(nw,'_','\n')
+           nw = fct_reorder(nw, desc(n_nodes) )) %>% 
+    arrange(Biodomain)
+  
+  p = ggplot(tmp, aes(delta_fdr, Biodomain))+
+    geom_vline(xintercept = 0, lwd = 0.3)+
+    geom_jitter(data = subset(tmp, (top_kd %in% c('ef1','both') & 
+                                      ef1_fdr > -log10(0.05) & 
+                                      delta_fdr > 0 & 
+                                      pct_term > 50)==F ), 
+                color = 'grey90', alpha = .1, size = .5, shape = 21)+
+    geom_jitter(data = subset(tmp, (top_kd %in% c('ef1','both') & 
+                                      ef1_fdr > -log10(0.05) & 
+                                      delta_fdr > 0 & 
+                                      pct_term > 50)==T ), 
+                alpha = .5, shape = 21, color = 'grey30', aes(fill = color, size = ef1_fdr))+
+    geom_violin(data = subset(tmp, (top_kd %in% c('ef1','both') & 
+                                      ef1_fdr > -log10(0.05) & 
+                                      delta_fdr > 0 & 
+                                      pct_term > 50)==T ),
+                aes(color = color), scale = 'width', alpha=.3, trim = T)+
+    labs(y = '', x = '\u0394 FDR, ef1 - ef0')+
+    # ggrepel::geom_label_repel(
+    #   data = subset(tmp, Biodomain == 'Structural Stabilization'),
+    #   aes(label = paste0(NODE, '\n', MODULE)), size = 2, alpha = .7,
+    #   max.overlaps = 100)+
+    facet_wrap(~nw, scale = 'free_x')+ 
+    theme(legend.position = 'top')+
+    scale_size_continuous('KDA FDR, -log10',  range = c(.5,3))+
+    scale_color_identity()+scale_fill_identity()
+  
+  cat("  \n###",  i, "  \n")
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}
 ```
 
+## Top KD per SD {.tabset}
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=12, fig.height=15}
+bd = top.kd$bd %>% unique()
+plot.new();dev.off()
 
-```{r fig.width=10, fig.height=12}
-tmp <- top.kd %>% 
-  left_join(., subdoms %>% select(network=sd, bd)) %>% 
-  group_by(network,kd_biodom) %>% 
-  mutate(n_kd = length(unique(paste0(NODE,':',MODULE)))) %>% 
-  ungroup() %>% 
-  mutate(kd_biodom = fct_reorder(kd_biodom, n_kd),
-         network = paste0(network, '\n', n_nodes, ' nodes'),
-         network = fct_reorder(network, desc(n_nodes) )) %>% 
-  arrange(kd_biodom)
+for(i in bd){
+  
+  tmp <- top.kd %>% 
+    filter(bd == i) %>% 
+    rename(nw = sd) %>% 
+    left_join(., subdoms %>% select(nw=sd, bd)) %>% 
+    group_by(nw,kd_biodom) %>% 
+    mutate(n_kd = length(unique(paste0(NODE,':',MODULE)))) %>% 
+    ungroup() %>% 
+    mutate(kd_biodom = fct_reorder(kd_biodom, n_kd),
+           nw = paste0(nw, '\n', n_nodes, ' nodes'),
+           nw = fct_reorder(nw, desc(n_nodes) )) %>% 
+    arrange(kd_biodom)
 
-ggplot(tmp, aes(FDR_ef1, kd_biodom))+
-  geom_jitter(alpha = .2, shape = 21, color = 'grey30', aes(fill = color))+
-  geom_violin(aes(color = color), scale = 'width', alpha=.3)+
-  labs(y = '', x = '\u0394 FDR, ef1 - ef0')+
-  facet_wrap(bd~network, scales = 'free_x')+ # 
-  scale_fill_identity()+scale_color_identity()
+  p = ggplot(tmp, aes(ef1_fdr, kd_biodom))+
+    geom_jitter(alpha = .2, shape = 21, color = 'grey30', aes(fill = color))+
+    geom_violin(aes(color = color), scale = 'width', alpha=.3)+
+    labs(y = '', x = '\u0394 FDR, ef1 - ef0')+
+    facet_wrap(~nw, scales = 'free_x')+ # 
+    scale_fill_identity()+scale_color_identity()
+  
+  cat("  \n###",  i, "  \n")
+  plot(p)
+  plot.new()
+  dev.off()
+  cat("  \n  \n")  
+  
+}  
+
 ```
 
 ## KD for each biodom across networks {.tabset}  
 ```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=10, fig.height=7}
-bd = kd$Biodomain %>% unique %>% sort
+bd = top.kd$kd_biodom %>% unique %>% sort
 plot.new();dev.off()
 for(i in 1:length(bd)) {
   cat("  \n###",  bd[i], "  \n")
   
   tmp <- top.kd %>% 
-    group_by(network) %>%
+    rename(nw = sd) %>% 
+    group_by(bd,nw) %>%
     mutate(
-      fdr_rank = rank(FDR_ef1) / length(FDR_ef1),
+      fdr_rank = rank(ef1_fdr) / length(ef1_fdr),
       delta_rank = rank(delta_fdr) / length(delta_fdr)
       ) %>%
-    group_by(network,kd_biodom) %>% 
+    group_by(nw,kd_biodom) %>% 
     mutate(n_kd = length(unique(paste0(NODE,':',MODULE)))) %>% 
     ungroup() %>% 
     mutate(kd_biodom = fct_reorder(kd_biodom, n_kd),
-         network = paste0(network, '\n', n_nodes, ' nodes'),
-         network = fct_reorder(network, desc(n_nodes) )) %>% 
+         nw = paste0(bd,'\n', nw, '\n', n_nodes, ' nodes'),
+         nw = fct_reorder(nw, desc(n_nodes) )) %>% 
     filter(kd_biodom == bd[i]) %>% 
     arrange(kd_biodom)
   
   if(nrow(tmp)==0){next}
   
   if(tmp %>% filter(fdr_rank > .25 & delta_rank > .25) %>% nrow == 0){
-    p = ggplot(tmp, aes(FDR_ef1, delta_fdr))+
+    p = ggplot(tmp, aes(ef1_fdr, delta_fdr))+
       geom_hline(yintercept = 0, lwd = 0.3)+
       geom_abline(intercept = 0, slope = 1, lty =2, lwd = 0.3)+
-      geom_jitter(size = 2, alpha = .5, color = 'grey30', aes(fill = color, shape = MEMBER))+
+      geom_jitter(size = 2, alpha = .5, color = 'grey30',
+                  aes(fill = color, shape = MEMBER))+
       labs(x = 'ef1 FDR', y = '\u0394 FDR, ef1 - ef0')+
       ggrepel::geom_label_repel(
         # data = subset(tmp, fdr_rank > .25 & delta_rank > .25 ),
         aes(label = paste0(NODE, '\n', MODULE)), 
         size = 2, alpha = .7, min.segment.length = 0, max.overlaps = 7)+
-      facet_wrap(~network, scales = 'free', nrow = 3)+ 
+      facet_wrap(~nw, scales = 'free', nrow = 3)+ 
       scale_shape_manual(values = c(23,21))+scale_color_identity()+scale_fill_identity()
   } else {
-    p = ggplot(tmp, aes(FDR_ef1, delta_fdr))+
+    p = ggplot(tmp, aes(ef1_fdr, delta_fdr))+
       geom_hline(yintercept = 0, lwd = 0.3)+
       geom_abline(intercept = 0, slope = 1, lty =2, lwd = 0.3)+
-      geom_jitter(size = 2, alpha = .5, color = 'grey30', aes(fill = color, shape = MEMBER))+
+      geom_jitter(size = 2, alpha = .5, color = 'grey30', 
+                  aes(fill = color, shape = MEMBER))+
       labs(x = 'ef1 FDR', y = '\u0394 FDR, ef1 - ef0')+
       ggrepel::geom_label_repel(
         data = subset(tmp, fdr_rank > .25 & delta_rank > .25 ),
         aes(label = paste0(NODE, '\n', MODULE)), 
         size = 2, alpha = .7, min.segment.length = 0, max.overlaps = 7)+
-      facet_wrap(~network, scales = 'free', nrow = 3)+ 
+      facet_wrap(~nw, scales = 'free', nrow = 3)+ 
       scale_shape_manual(values = c(23,21))+scale_color_identity()+scale_fill_identity()
   }
 
@@ -642,34 +698,25 @@ for(i in 1:length(bd)) {
 ## KD subnetwork from each network {.tabset}
 
 ```{r echo=FALSE,warning=FALSE,message=FALSE,results='asis', fig.width=10, fig.height=10}
-dom = subdoms$sd %>% unique
 plot.new();dev.off()
-for(j in 1:length(dom)){
+for(j in 1:nrow(subdoms)){
   
-  cat("  \n###",  dom[j], "  \n")
-  
-  # pull NW to view subgraphs
-  nw = subdoms %>% filter(sd == dom[j]) %>% 
-    pull(nw.dir) %>% .[[1]] %>% 
-    filter(grepl('bdFilt.+graphml',name)) %>% 
-    pull(id) %>% synGet(.) %>% .$path %>% 
-    read_graph(., format = 'graphml')
-  snw = igraph::simplify(nw, remove.multiple = T)
+  cat("  \n###",  subdoms$bd[j], ' ', subdoms$sd[j], "  \n")
   
   # specify nodes
   kd.nodes <- top.kd %>%
-    filter(network == dom[j]) %>% 
+    filter(bd == subdoms$bd[j], sd == subdoms$sd[j]) %>% 
     mutate(
-      fdr_rank = rank(FDR_ef1) / length(FDR_ef1),
+      fdr_rank = rank(ef1_fdr) / length(ef1_fdr),
       delta_rank = rank(delta_fdr) / length(delta_fdr)
     ) %>%
     select(NODE, node_status, MODULE, kd_biodom, MEMBER, color, top_kd, contains(c('fdr', 'rank'))) %>% 
-    arrange(desc(delta_fdr), desc(FDR_ef1)) %>%
+    arrange(desc(delta_fdr), desc(ef1_fdr)) %>%
     # group_by(Biodomain, NODE, MODULE, MEMBER, color) %>% 
     group_by( NODE ) %>% 
     summarise(n_biodom = length(unique(kd_biodom))
            , n_term = length(unique(MODULE))
-           , ef1_max = max(FDR_ef1)
+           , ef1_max = max(ef1_fdr)
            , delta_max = max(delta_fdr)
            , sum_delta_rank = sum(delta_rank)
            , sum_fdr_rank = sum(fdr_rank)
@@ -684,6 +731,15 @@ for(j in 1:length(dom)){
     next 
     }
 
+  # pull NW to view subgraphs
+  nw = subdoms %>% 
+    filter(bd == subdoms$bd[j], sd == subdoms$sd[j]) %>% 
+    pull(nw.dir) %>% .[[1]] %>% 
+    filter(grepl('bdFilt.+graphml',name)) %>% 
+    pull(id) %>% synGet(.) %>% .$path %>% 
+    read_graph(., format = 'graphml')
+  snw = igraph::simplify(nw, remove.multiple = T)
+  
   # subnetwork of just KD Nodes  
   vert_num <- match(kd.nodes$NODE, V(snw)$name)
   vert_neigh <- neighbors(snw, vert_num)
@@ -716,7 +772,7 @@ for(j in 1:length(dom)){
     scale_size_continuous(range = c(3,12))+
     geom_node_text(aes(label = name, filter = .N()$kd == 1), size = 3) +
     viridis::scale_fill_viridis()+
-    labs(subtitle = paste0(dom[j], ' network KDs'))+
+    labs(subtitle = paste0(subdoms$sd[j], ' network KDs'))+
     theme_graph(background = 'white')
   
   plot(kd_nw)
@@ -734,9 +790,10 @@ for(j in 1:length(dom)){
 
 ```{r fig.width=5, fig.height=5}
 tmp <- top.kd %>% 
+  mutate(network = paste0(bd,':',sd)) %>% 
   group_by(network) %>% 
   mutate(
-    fdr_rank = rank(FDR_ef1) / length(FDR_ef1),
+    fdr_rank = rank(ef1_fdr) / length(ef1_fdr),
     delta_rank = rank(delta_fdr) / length(delta_fdr)
   ) %>% 
   group_by(NODE) %>% 
@@ -750,7 +807,8 @@ tmp <- top.kd %>%
     sum_fdr_rank = sum(fdr_rank)
     ) %>% 
   ungroup() %>% 
-  arrange( desc(n_nw), desc(sum_delta_rank) ) #, desc(n_biodom)
+  mutate(AgoraNom = if_else(NODE %in% agora$hgnc_symbol, T, F)) %>% 
+  relocate(AgoraNom, .after = NODE) %>%   arrange( desc(n_nw), desc(sum_delta_rank) ) #, desc(n_biodom)
 
 DT::datatable(tmp, rownames = F, filter = 'top') %>% 
   DT::formatSignif(columns = c('sum_delta_rank','sum_fdr_rank', 'mean_delta_rank','mean_fdr_rank'), digits = 2)
@@ -759,7 +817,8 @@ DT::datatable(tmp, rownames = F, filter = 'top') %>%
 ```{r fig.width=8, fig.height=6}
 ggplot(tmp, aes(sum_fdr_rank, sum_delta_rank))+ 
   geom_abline(intercept = 0, slope = 1, lty = 2, lwd = .5)+
-  geom_point(alpha = .2, aes(size = n_nw))+
+  geom_point(alpha = .3, shape = 21, color = 'grey30', aes(size = n_nw, fill = AgoraNom))+
+  scale_fill_manual(values=c('grey80','blue'))+
   ggrepel::geom_label_repel(
     data = subset(tmp, n_nw >= 4), aes(label = NODE)
     , size = 2, min.segment.length = 0, max.overlaps = 20)
@@ -768,9 +827,10 @@ ggplot(tmp, aes(sum_fdr_rank, sum_delta_rank))+
 ## Top MODULES across networks {.tabset}   
 ```{r }
 tmp <- top.kd %>% 
+  mutate(network = paste0(bd,':',sd)) %>% 
   group_by(network) %>% 
   mutate(
-    fdr_rank = rank(FDR_ef1) / length(FDR_ef1),
+    fdr_rank = rank(ef1_fdr) / length(ef1_fdr),
     delta_rank = rank(delta_fdr) / length(delta_fdr)
   ) %>% 
   group_by(kd_biodom, MODULE, color) %>% 
@@ -797,7 +857,9 @@ ggplot(tmp, aes(sum_fdr_rank, sum_delta_rank))+
   geom_point(shape = 21, color = 'black', alpha = .3, aes(size = n_nw, fill = color))+
   scale_fill_identity()+ 
   ggrepel::geom_label_repel(
-    data = subset(tmp, n_nw >= 5 & MODULE %in% enr.bd$pathway[which(enr.bd$padj < 0.05)] ),
+    data = subset(tmp, n_nw >= 5 
+                  & MODULE %in% enr.bd$Description[which(enr.bd$p.adjust < 0.05)] 
+                  ),
     aes(label = paste0(str_trunc(MODULE, width = 30, side = 'right')) )
     , size = 2.5, min.segment.length = 0, max.overlaps = 20)
 # +
@@ -849,9 +911,10 @@ for(i in 1:length(bd)) {
 ## Top NODE-MODULE combinations across networks 
 ```{r }
 tmp <- top.kd %>% 
+  mutate(network = paste0(bd,':',sd)) %>% 
   group_by(network) %>% 
   mutate(
-    fdr_rank = rank(FDR_ef1) / length(FDR_ef1),
+    fdr_rank = rank(ef1_fdr) / length(ef1_fdr),
     delta_rank = rank(delta_fdr) / length(delta_fdr)
   ) %>% 
   group_by(kd_biodom, NODE, MODULE, MEMBER, color) %>% 
@@ -897,7 +960,8 @@ bd = tmp$kd_biodom %>% unique %>% sort
 plot.new();dev.off()
 for(i in 1:length(bd)) {
   cat("  \n####",  bd[i], "  \n")
-  if( (tmp %>% filter(kd_biodom == bd[i], n_nw  >= 2, MODULE %in% enr.bd$pathway[enr.bd$padj < 0.05]) %>% nrow())==0 ){
+  if( (tmp %>% filter(kd_biodom == bd[i], n_nw  >= 2, 
+                      MODULE %in% enr.bd$Description[enr.bd$p.adjust < 0.05]) %>% nrow())==0 ){
     p <- ggplot(
       data = subset(tmp, kd_biodom == bd[i]),
       aes(mean_fdr_rank, mean_delta_rank)
@@ -918,7 +982,7 @@ for(i in 1:length(bd)) {
       scale_fill_identity()+ scale_shape_manual('KD in term',values = c(23, 21))+
       ggrepel::geom_label_repel(
         data = subset(tmp, n_nw >= 2 & kd_biodom == bd[i]
-                      & MODULE %in% enr.bd$pathway[enr.bd$padj < 0.05]
+                      & MODULE %in% enr.bd$Description[enr.bd$p.adjust < 0.05]
                       ), 
         aes(label = paste0(NODE,'\n',str_trunc(MODULE, width = 40, side = 'right')) )
         , size = 2, min.segment.length = 0, max.overlaps = 20, alpha = .6)+
@@ -943,7 +1007,7 @@ ggplot(tmp, aes(sum_fdr_rank, sum_delta_rank))+
   geom_point(data = subset(tmp, AgoraNom), shape = 8, color = 'black', alpha = .3, aes(size = n_nw))+
   scale_fill_identity()+ scale_shape_manual('KD in term',values = c(23, 21))+
   ggrepel::geom_label_repel(
-    data = subset(tmp, n_nw >= 4 | (AgoraNom & n_nw >=3)),
+    data = subset(tmp, n_nw >= 4 | (AgoraNom & n_nw >= 2)),
     aes(label = paste0(NODE,'\n',str_trunc(MODULE, width = 45, side = 'right')) )
     , size = 2.5, min.segment.length = 0, max.overlaps = 20)
   # +
@@ -956,7 +1020,7 @@ plot.new();dev.off()
 for(i in 1:length(bd)) {
   cat("  \n####",  bd[i], "  \n")
   if( (tmp %>% filter(kd_biodom == bd[i], n_nw  >= 3, !duplicated(NODE) ,
-                      MODULE %in% enr.bd$pathway[enr.bd$padj < 0.05]) %>% nrow())==0 ){
+                      MODULE %in% enr.bd$Description[enr.bd$p.adjust < 0.05]) %>% nrow())==0 ){
     p <- ggplot(
       data = subset(tmp, kd_biodom == bd[i]),
       aes(sum_fdr_rank, sum_delta_rank)
@@ -977,7 +1041,7 @@ for(i in 1:length(bd)) {
       scale_fill_identity()+ scale_shape_manual('KD in term',values = c(23, 21))+
       ggrepel::geom_label_repel(
         data = subset(tmp, n_nw >= 3 & kd_biodom == bd[i] 
-                      & MODULE %in% enr.bd$pathway[enr.bd$padj < 0.05]
+                      & MODULE %in% enr.bd$Description[enr.bd$p.adjust < 0.05]
                       # & !duplicated(NODE)
                       ), 
         aes(label = paste0(NODE,'\n',str_trunc(MODULE, width = 40, side = 'right')) )

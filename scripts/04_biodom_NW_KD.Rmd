@@ -40,97 +40,101 @@ theme_set(theme_bw())
 ```
 
 ## functions
-nw data  
+<!-- nw data   -->
+<!-- ```{r} -->
+<!-- read_nw <- function(dom_idx){ -->
+
+<!--   nw = read.graph( -->
+<!--     synGet( -->
+<!--       doms$nw.dir[[dom_idx]] %>% filter( grepl('bdFiltered.+graphml', name) ) %>% pull(id) -->
+<!--     )$path, -->
+<!--     format = 'graphml' -->
+<!--     ) -->
+
+<!--   return(nw) -->
+
+<!-- } -->
+<!-- ``` -->
+
+read synapse directories into a dataframe
 ```{r}
-read_nw <- function(dom_idx){
-  
-  nw = read.graph(
-    synGet(
-      doms$nw.dir[[dom_idx]] %>% filter( grepl('bdFiltered.+graphml', name) ) %>% pull(id)
-    )$path,
-    format = 'graphml'
-    )
-
-  return(nw)
-  
+read_syn_dir <- function(parent_id){
+  synapser::synGetChildren(parent_id)$asList() %>%
+    tibble(f = .) %>% unnest_wider(f)
 }
-
+```
+ 
+NW info 
+```{r}
 v_info <- function(net){
-  v.attr <- tibble( na = vertex.attributes(net) ) %>%
-    t() %>% 
-    as_tibble(rownames = NA, .name_repair = 'unique') %>% 
-    unnest(everything()) %>%
-    rename_with(., ~names(vertex.attributes(net)), everything())
+  v.attr <- tibble( na = vertex.attributes(net) ) %>% t() %>% 
+    as_tibble(rownames = NA, .name_repair = ~vertex_attr_names(net) ) %>% 
+    unnest(everything()) 
 }
 
 e_info <- function(net){
-  e.attr <- tibble( ea = edge.attributes(net) ) %>% 
-    t() %>% 
-    as_tibble(rownames = NA, .name_repair = 'unique') %>% 
-    unnest(everything()) %>% 
-    rename_with(., ~names(edge.attributes(net)), everything())
+  e.attr <- tibble( ea = edge.attributes(net) ) %>% t() %>% 
+    as_tibble(rownames = NA, .name_repair = ~edge_attr_names(net) ) %>% 
+    unnest(everything()) 
 }
 ```
 
 read KDA result data  
 ```{r}
-# remote from synase
-read_kd_remote <- function(kda_dir_syn_id){
+read_kd <- function(path){
   
-  synDir <- synGetChildren(kda_dir_syn_id)$asList() %>%
-  tibble(f = .) %>% unnest_wider(f)
-  
-  
-  kd.ef0 <- read_tsv(
-    synGet( 
-      synDir %>% filter( grepl('edgeFactor_0.results.txt', name) ) %>% pull(id)
-      )$path, 
-    col_types = cols())
-  kd.ef1 <- read_tsv(
-    synGet( 
-      synDir %>% filter( grepl('edgeFactor_1.results.txt', name) ) %>% pull(id)
-      )$path, 
-    col_types = cols())
-  kd.top <- read_tsv(
-    synGet( 
-      synDir %>% filter( grepl('edgeFactor_1.tophits.txt', name) ) %>% pull(id)
-      )$path, 
-    col_types = cols()) %>% 
-    mutate(kd = paste0(NODE,'-',MODULE))
+  # detect if KDA dir path is on synapse
+  if(substr(path,1,3) == 'syn'){
+        
+    synDir <- synGetChildren(path)$asList() %>%
+      tibble(f = .) %>% unnest_wider(f)
     
-  kd = bind_rows(
-    kd.ef0 %>% mutate(ef = 'ef0_fdr'),
-    kd.ef1 %>% mutate(ef = 'ef1_fdr')
-    ) %>% 
-    mutate(FDR = -log10(FDR)) %>%
-    pivot_wider(id_cols = c(MODULE, NODE, MEMBER), 
-                names_from = ef, values_from = FDR, values_fill = 0) %>%
-    mutate(delta_fdr = ef1_fdr - ef0_fdr) %>% arrange(desc(delta_fdr)) %>% 
-    mutate(top = 0)
+    kd.ef0 <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_0.results.txt', name) ) %>% pull(id)
+        )$path, 
+        col_types = cols())
+    ef0.top <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_0.tophits.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+    
+    kd.ef1 <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_1.results.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols())
+    ef1.top <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_1.tophits.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
   
-  if( any( kd.top$FDR < 0.05 ) ){
-    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% kd.top$kd[kd.top$FDR < 0.05]) ] <- 1
+  # or read from a local path
+  } else {
+    
+    kd.pth <- list.files(path, full.names = T)
+  
+    kd.ef0 <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_0.results.txt'), 
+      col_types = cols())
+    kd.top <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.tophits.txt'), 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+    kd.ef1 <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.results.txt'),  
+      col_types = cols())
+    kd.top <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.tophits.txt'), 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
   }
-  
-  return(kd)
-}
-
-# local directory
-read_kd_local <- function(local_path){
-  
-  kd.pth <- list.files(local_path, full.names = T)
-  
-  kd.ef0 <- read_tsv(
-    kd.pth %>% str_subset('_0.results.txt'), 
-    col_types = cols())
-  kd.ef1 <- read_tsv(
-    kd.pth %>% str_subset('_1.results.txt'),  
-    col_types = cols())
-  kd.top <- read_tsv(
-    kd.pth %>% str_subset('_1.tophits.txt'), 
-    col_types = cols()) %>% 
-    mutate(kd = paste0(NODE,'-',MODULE))
     
+  # Join up the results
   kd = bind_rows(
     kd.ef0 %>% mutate(ef = 'ef0_fdr'),
     kd.ef1 %>% mutate(ef = 'ef1_fdr')
@@ -139,10 +143,14 @@ read_kd_local <- function(local_path){
     pivot_wider(id_cols = c(MODULE, NODE, MEMBER), 
                 names_from = ef, values_from = FDR, values_fill = 0) %>%
     mutate(delta_fdr = ef1_fdr - ef0_fdr) %>% arrange(desc(delta_fdr)) %>% 
-    mutate(top = 0)
+    mutate(top = 0, top_ef0 = 0)
   
-  if( any( kd.top$FDR < 0.05 ) ){
-    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% kd.top$kd[kd.top$FDR < 0.05]) ] <- 1
+  # Indicate which driver-module pairs are top for each analysis
+  if( any( ef1.top$FDR < 0.05 ) ){
+    kd$top[ which(paste0(kd$NODE,'-',kd$MODULE) %in% ef1.top$kd[ef1.top$FDR < 0.05]) ] <- 1
+  }
+  if( any( ef0.top$FDR < 0.05 ) ){
+    kd$top_ef0[ which(paste0(kd$NODE,'-',kd$MODULE) %in% ef0.top$kd[ef0.top$FDR < 0.05]) ] <- 1
   }
   
   return(kd)
@@ -228,6 +236,11 @@ scores <- read_csv(
 omics <- read_csv(
   synTableQuery('select * from syn22758536', includeRowIdAndRowVersion = F)$filepath
   , col_types = cols())
+npath <- read_csv(
+  synTableQuery('select * from syn32288310', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+agora <- read_csv(synGet('syn12540368')$path, quote = '"', col_types = cols())
 
 # biological domain annotations
 biodom <- full_join(
@@ -242,24 +255,12 @@ biodom <- full_join(
 domains = biodom %>% pull(Biodomain) %>% unique() %>% sort()
 
 # enriched biodomain terms
-enr.bd <- read_csv( synGet('syn45824995')$path, col_types = cols() ) %>% 
-  mutate(leadingEdge_genes = str_split(leadingEdge_genes, '\\|'))
+enr.bd <- synGet('syn52749187') %>% .$path %>% readRDS() %>% 
+  filter(score == 'Overall') %>% select(anno) %>% unnest(anno) %>% 
+  mutate(leadingEdge_genes = str_split(core_enrichment, '\\|'))
 
 # base network
 base_net <- igraph::read_graph(synGet('syn51110930')$path, format = 'graphml') 
-
-# specify directed edge types
-directed_edge_types = c("catalysis-precedes",
-                        "controls-expression-of",
-                        "controls-phosphorylation-of",
-                        "controls-state-change-of",
-                        "controls-transport-of"
-                        )
-```
-
-pre-filtered NWs    
-```{r}
-undir <- base_net
 
 # filt node & edge
 tmp <- igraph::delete_vertices(
@@ -272,51 +273,13 @@ undir_node_edge <- igraph::subgraph.edges(
   delete.vertices = T 
 )
 
-# filt node
-undir_node <- igraph::delete_vertices(
-    base_net,
-    igraph::V(base_net)[ igraph::V(base_net)$brain_exp == 0 ]
-  )
-
-# filt edge
-undir_edge <- igraph::subgraph.edges(
-    base_net,
-    igraph::E(base_net)[ igraph::E(base_net)$n_edge_evidence > 1 ],
-    delete.vertices = T 
-  )
-
-# dir
-dir <- igraph::subgraph.edges( 
-    base_net, 
-    igraph::E(base_net)[ igraph::E(base_net)$directed == 1 ],
-    delete.vertices = T 
-  ) %>% 
-    as.directed(mode = 'arbitrary')
-
-# dir node edge
-dir_node_edge <- igraph::subgraph.edges( 
-    undir_node_edge, 
-    igraph::E(undir_node_edge)[ igraph::E(undir_node_edge)$directed == 1 ],
-    delete.vertices = T 
-  ) %>% 
-    as.directed(mode = 'arbitrary')
-
-# dir node
-dir_node <- igraph::subgraph.edges( 
-    undir_node, 
-    igraph::E(undir_node)[ igraph::E(undir_node)$directed == 1 ],
-    delete.vertices = T 
-  ) %>% 
-    as.directed(mode = 'arbitrary')
-
-# dir edge
-dir_edge <- igraph::subgraph.edges( 
-    undir_edge, 
-    igraph::E(undir_edge)[ igraph::E(undir_edge)$directed == 1 ],
-    delete.vertices = T 
-  ) %>% 
-    as.directed(mode = 'arbitrary')
-
+# specify directed edge types
+directed_edge_types = c("catalysis-precedes",
+                        "controls-expression-of",
+                        "controls-phosphorylation-of",
+                        "controls-state-change-of",
+                        "controls-transport-of"
+                        )
 ```
 
 Read CRISPRbrain phenotype data 
@@ -376,17 +339,17 @@ simple <- tibble(expt = simple$expt %>% unique() %>% sort(),
 
 read results from synapse  
 ```{r}
-# top level biodom directory
-doms <- synGetChildren('syn51739831')$asList() %>%
-  tibble(f = .) %>% unnest_wider(f) %>%
-  filter( grepl('Folder',type) ) %>%
+synLogin()
+
+doms  <-  read_syn_dir('syn51739831') %>%  # biodomain
+  filter(grepl('Folder', type)) %>% 
   select(bd = name, id) %>% 
-  arrange(bd) %>% 
-  mutate(i = 1:nrow(.)) %>% 
   rowwise() %>% 
   mutate(
-    nw.dir = synGetChildren(  parent = id  )$asList() %>% tibble(f = .) %>% unnest_wider(f) %>% list(),
-    kd.dir = synGetChildren(  parent = nw.dir$id[grepl('kda',nw.dir$name)]  )$asList() %>% tibble(f = .) %>% unnest_wider(f) %>% list()
+    nw.dir = synGetChildren(  parent = id  )$asList() %>% 
+      tibble(f = .) %>% unnest_wider(f) %>% list(),
+    kd.dir = synGetChildren(  parent = nw.dir$id[grepl('kda',nw.dir$name)]  )$asList() %>% 
+      tibble(f = .) %>% unnest_wider(f) %>% list()
     )
 ```
 
@@ -448,34 +411,27 @@ nw.dat$edges = map(
 )
 ```
 
-# Module Representation
-Compare the distributions between filtered base network and traced network  
 ```{r}
-modules <- biodom %>% 
-  select(Biodomain, GO_ID, GOterm_Name, symbol, n_symbol) %>% 
-  mutate(
-    path_commons = length( intersect( names(V(base_net)), symbol ) ),
-    node_filt = NA,#length( intersect( names(V(undir_node)), symbol ) ),
-    edge_filt = NA,#length( intersect( names(V(undir_edge)), symbol ) ),
-    node_edge_filt = length( intersect( names(V(undir_node_edge)), symbol ) )
+modules <- read_tsv(
+  here::here('results','biodomain',
+             'module_representation_across_networks.tsv'),
+  col_types = cols()
   )
 
-for(i in 1:nrow(nw.dat)){
-  x <- c()
-  for(j in 1:nrow(modules)){
-    x <- c(x,
-           length(intersect( nw.dat$nodes[[i]][[1]], modules$symbol[[j]] )) )
-  
-  }
-  modules <- tibble(x) %>% setNames( nw.dat$bd[i] ) %>% bind_cols(modules, .)
-}
-
 tmp <- modules %>% 
-  pivot_longer(cols = 10:ncol(modules)) %>% 
-  mutate( biodom_nw = 100*(value / n_symbol),
-          base_nw = 100*(node_edge_filt / n_symbol) ) %>%
+  pivot_longer(cols = 8:ncol(modules)) %>% 
+  mutate( 
+    # biodom_nw = value
+    # , n_nw = (biodom_nw/100)*n_symbol
+    # , base_nw = node_edge_filt
+    
+    biodom_nw = 100*(value / n_symbol)
+    , base_nw = 100*(node_edge_filt / n_symbol)
+          ) %>%
   # left_join(., subdoms %>% select(bd, name = sd)) %>% 
-  rename(bd = name, n_nw = value) %>% 
+  rename(bd = name
+         , n_nw = value
+         ) %>% 
   pivot_longer(cols = c(biodom_nw, base_nw)) %>% 
   rename(pct = value) %>% 
   filter(n_nw >= 3, pct > 0) 
@@ -488,6 +444,7 @@ ggplot(tmp, aes(pct) )+
   labs(x = '% GO term genes in NW', 
        subtitle = 'distribution of all terms >0% and >=3 genes in each NW class')
 ```
+
 # Key Driver Analysis 
 
 Network by network explore the effects of NW filters on traces & KDs for these sets:
@@ -512,6 +469,7 @@ for(dom in doms$bd){
   nw_terms <- biodom %>% 
     filter(!is.na(n_symbol),n_symbol > 0) %>% 
     select(Biodomain, MODULE = GOterm_Name, NODE = symbol, n_symbol) %>% 
+    rowwise() %>% 
     mutate(
       n_nw = length( intersect( NODE, names(V(snw)) ) ),
       pct_term = 100*(n_nw/n_symbol)
@@ -521,14 +479,14 @@ for(dom in doms$bd){
   # get KDA results and annotate
   kd.res <- doms %>% filter(bd == dom) %>% 
     pull(nw.dir) %>% .[[1]] %>% filter(name == 'kda') %>% 
-    pull(id) %>% read_kd_remote(.)
+    pull(id) %>% read_kd(.)
   
   kd.res <- kd.res %>% 
     left_join(
       ., nodes %>% select(NODE = name, node_status)
     ) %>% 
     left_join(
-      ., biodom %>% select(MODULE = GOterm_Name, Biodomain, abbr:color) 
+      ., biodom %>% select(MODULE = GOterm_Name, Biodomain:TopSD, abbr:color) 
     ) %>% 
     left_join(
       ., nw_terms %>% select(MODULE, n_symbol:pct_term) %>% distinct()
@@ -558,7 +516,7 @@ for(dom in doms$bd){
     filter( !is.na(Biodomain) ) %>% 
     mutate(across(.cols = c(n_term:n_kd), ~if_else(is.na(.x), as.integer(0), .x))) 
   
-      ##
+    ##
     # CBrain phenotype associations with KDs
     if( length(kd.hits) > 0 ){
       
@@ -731,7 +689,7 @@ for(dom in doms$bd){
       scale_shape_manual(name='Node Source', breaks=c('added', 'query'),
                          values=c('added'=23, 'query'=21))+
       scale_size_continuous(range = c(3,12))+
-      geom_node_text(aes(label = name, filter = .N()$kd == 1), size = 1.5) +
+      geom_node_text(aes(label = name, filter = .N()$kd == 1), size = 3) +
       viridis::scale_fill_viridis()+
       theme_graph(background = 'white')
   
@@ -795,80 +753,6 @@ for(dom in doms$bd){
 }
 ```
 
-
-```{r}
-  # # CRISPRbrain -- logistic regression
-  # cbrain_lr <- simple %>%
-  #   mutate(cb_hit = if_else( `Hit Class` == 'Non-Hit', 0, 1)) %>%
-  #   select(cell, mode, expt, Gene, cb_hit) %>% distinct() %>%
-  #   mutate(kd = if_else(Gene %in% kd.hits, 1, 0)) %>%
-  #   left_join(., tibble(Gene = names(V(snw)), node_degree = degree(nw)) ) %>%
-  #   filter(!is.na(node_degree)) %>%
-  #   group_by(cell,mode,expt) %>%
-  #   mutate(
-  #     lr = glm( cb_hit~kd+node_degree, 
-  #               family=binomial(link='logit')) %>% broom::tidy() %>%
-  #            filter(term == 'kd') %>%
-  #            mutate(nobs = glm( cb_hit~kd+node_degree, 
-  #                               family=binomial(link='logit')) %>%
-  #                     broom::glance() %>% pull(nobs)) %>% list()
-  #     ) %>%
-  #   unnest(lr)  %>%
-  #   select(cell, mode, expt, term:nobs) %>% distinct() %>%
-  #   # filter(p.value < 0.05) %>%
-  #   arrange(desc(statistic),p.value) 
-  # 
-  # cbrain_lr_dt <- cbrain_lr %>% 
-  #   select(cell:expt, estimate:p.value) %>%
-  #   DT::datatable(rownames = F, filter = 'top', caption = 'cb_hit ~ kd + node_degree',
-  #                 options = list(pageLength = 6)) %>% #
-  #   DT::formatSignif(columns = c('estimate', 'std.error','statistic', 'p.value'))
-  # 
-  # #  CRISPRbrain -- linear regression
-  # tmp <- top.kd %>% inner_join( simple,., by =c('Gene'='NODE')) %>%
-  #   left_join(., tibble(Gene = names(V(snw)), node_degree = degree(snw)) ) %>%
-  #   mutate(node_degree = scale(node_degree, center = T, scale = T), 
-  #          ef1_fdr = scale(ef1_fdr, center = T, scale = T),
-  #          delta_fdr = scale(delta_fdr, center = T, scale = T)
-  #          ) 
-  # 
-  # cbrain_lm1_dt <- tmp %>%
-  #   group_by(cell,mode,expt) %>%
-  #   mutate(gs = scale(abs(gene_score), center = T, scale = T),
-  #          lm = lm(gs~ef1_fdr+node_degree) %>% broom::tidy() %>%
-  #            filter(term == 'ef1_fdr') %>%
-  #            mutate(r.squared = lm(abs(gene_score)~ef1_fdr+node_degree) %>%
-  #                     broom::glance() %>% pull(r.squared),
-  #                   nobs = lm(abs(gene_score)~ef1_fdr+node_degree) %>%
-  #                     broom::glance() %>% pull(nobs)) %>% list()) %>%
-  #   unnest(lm)  %>%
-  #   select(cell, mode, expt, term:nobs) %>% distinct() %>%
-  #   arrange(desc(statistic),p.value) %>% 
-  #   DT::datatable(rownames = F, filter = 'top', 
-  #                 caption = 'abs(gene_score) ~ ef1_fdr + node_degree',
-  #                 options = list(pageLength = 6)) %>% #
-  #   DT::formatSignif(columns = c('statistic', 'std.error',
-  #                                'r.squared', 'p.value', 'estimate'))
-  # 
-  # cbrain_lm2_dt <- tmp %>%
-  #   group_by(cell,mode,expt) %>%
-  #   mutate(gs = scale( abs(gene_score), center = T, scale = T),
-  #          lm = lm(gs~delta_fdr+node_degree) %>% broom::tidy() %>%
-  #            filter(term == 'delta_fdr') %>%
-  #            mutate(r.squared = lm(gs~delta_fdr+node_degree) %>%
-  #                     broom::glance() %>% pull(r.squared),
-  #                   nobs = lm(gs~delta_fdr+node_degree) %>%
-  #                     broom::glance() %>% pull(nobs)) %>% list()) %>%
-  #   unnest(lm)  %>%
-  #   select(cell, mode, expt, term:nobs) %>% distinct() %>%
-  #   # filter(p.value < 0.05) %>%
-  #   arrange(desc(statistic),p.value) %>% 
-  #   DT::datatable(rownames = F, filter = 'top', 
-  #                 caption = 'abs(gene_score) ~ \u0394 fdr (ef1-ef0) + node_degree',
-  #                 options = list(pageLength = 6)) %>% #
-  #   DT::formatSignif(columns = c('statistic', 'std.error',
-  #                                'r.squared', 'p.value', 'estimate'))
-```
 
 # Session
 ```{r}

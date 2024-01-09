@@ -32,6 +32,20 @@ cat('\npackages loaded:\n', packages, '\n')
 synLogin()
 net <- igraph::read_graph(synGet('syn51110930')$path, format = 'graphml') 
 
+# biological domain annotations
+biodom <- full_join(
+  # biodomains
+  readRDS(synGet('syn25428992')$path),
+  # domain labels
+  read_csv(synGet('syn26856828')$path,
+           col_types = cols()),
+  by = c('Biodomain'='domain')
+) %>%
+  mutate(Biodomain = case_when(Biodomain == 'none' ~ NA_character_, T ~ Biodomain))
+
+domains <- biodom %>% pull(Biodomain) %>% unique() %>% sort() %>% .[!is.na(.)]
+
+
 # read arguments ----------------------------------------------------------
 
 # arguments
@@ -143,7 +157,7 @@ query = read_tsv( query.file %>% basename(), col_names = 'gene')
 input.gene.list <- query$gene
 if( length(setdiff( input.gene.list, names(V(nw)))) > 0 ){
   cat('\nQuery genes missing from filtered NW object: ',
-      setdiff( input.gene.list, names(V(nw)) ), sep = '\n')
+      setdiff( input.gene.list, names(V(nw)) ) %>% sort(), sep = '\n')
   cat('\n')
   
   input.gene.list = intersect( 
@@ -161,25 +175,81 @@ cat('Number of queried genes to trace: ',
 cat('\n','Beginning trace... \n')
 Sys.time()
 
+# ID target biodomain from path name
+dom = full_path %>% 
+  str_split('\\/') %>% 
+  unlist() %>% 
+  str_replace_all(., '_',' ') %>% 
+  str_subset(., paste0(domains, collapse = '|'))
+
+bd_genes <- biodom %>% 
+  filter(Biodomain == dom,
+         GO_ID != 'GO:0043227' # membrane-bound organelle w/ 12k genes annotated
+  ) %>%
+  pull(symbol) %>% 
+  unlist() %>% 
+  unique() %>% 
+  .[!is.na(.)]
+
+# remove redundant edges
+snw <- igraph::simplify(nw, 
+                        remove.multiple = TRUE,
+                        remove.loops = FALSE,
+                        edge.attr.comb = list( 
+                          interaction = 'concat',
+                          edge = 'random',
+                          occurrance = 'concat',
+                          n_edge = 'max',
+                          n_edge_types = 'max',
+                          n_edge_evidence = 'max',
+                          n_source = 'max',
+                          sources = 'concat',
+                          n_evidence = 'sum',
+                          evidence_pmid = 'concat',
+                          n_pathways = 'max',
+                          pathway_names = 'concat',
+                          directed = 'max')
+                        )
+
 # calculate edge weights for Dijkstra
-edges <- e_info(nw)
-verts <- v_info(nw)
+edges <- e_info(snw)
+verts <- v_info(snw)
 
 node_weights = verts %>% 
   select(name, trs = TargetRiskScore) %>% 
-  mutate(trs = if_else(is.nan(trs), 0, trs)) 
+  mutate(trs = if_else(is.nan(trs), 0, trs),
+         bd_gene = if_else(name %in% bd_genes, 5, 0)) 
 
 edge_weights = edges %>% 
   select(edge) %>% distinct() %>% 
   mutate(head = str_split_fixed(edge, ':',2)[,1], 
          tail = str_split_fixed(edge, ':',2)[,2]) %>% 
-  left_join(., node_weights %>% select(head = name, h.trs = trs)) %>% 
-  left_join(., node_weights %>% select(tail = name, t.trs = trs)) %>% 
-  mutate(weight = h.trs+t.trs)
+  left_join(., node_weights %>% select(head = name, h.trs = trs, h.bd = bd_gene)) %>% 
+  left_join(., node_weights %>% select(tail = name, t.trs = trs, t.bd = bd_gene)) %>% 
+  mutate(
+    ht.bd = case_when(
+      h.bd + t.bd == 10 ~ 5, 
+      h.bd + t.bd ==  5 ~ 3,
+      h.bd + t.bd ==  0 ~ 0),
+    # weight = (10-h.trs-h.bd)+(10-t.trs-t.bd)
+    weight = (5-h.trs)+(5-t.trs)+(5-ht.bd)
+    )
+
+# p = edge_weights %>%
+#   mutate(set = case_when(h.bd == 5 & t.bd == 5 ~ 'both bd',
+#                          h.bd == 5 & t.bd == 0 | h.bd == 0 & t.bd == 5 ~ 'one bd',
+#                          h.bd == 0 & t.bd == 0 ~ 'neither bd')) %>%
+#   ggplot(aes(weight, fill = set))+
+#   geom_density(alpha = .3)
+  # geom_histogram(position = 'dodge')
+# ggsave(here::here())
+
+
+weights = e_info(nw) %>% select(edge) %>% left_join(., edge_weights, by = 'edge')
+  igraph::edge_attr(nw, 'dijkstra_dist', index = igraph::E(nw)) <- weights$weight
 
 ##
 # trace paths in parallel
-snw <- igraph::simplify(nw, remove.multiple = T)
 
 future::plan(strategy = 'multisession', workers = 10)
 trace <- furrr::future_map(
@@ -189,15 +259,35 @@ trace <- furrr::future_map(
     target = .x,
     targets = input.gene.list,
     sentinals = input.gene.list,
-    edge_weights = NULL, # conduct a breadth first search
-    # edge_weights = edge_weights$weight, # or specify weights based on scores to perform Dijkstra's algorithm
+    
+    #conduct a breadth first search
+    edge_weights = NULL, 
+    
+    # #specify weights to perform Dijkstra's algorithm
+    # edge_weights = edge_weights$weight, 
     cores = 1)
 )
 future::plan(strategy = 'sequential')
 
+trace1 <- map_dfr(
+  trace, 
+  ~ tibble(
+    target = list(.x$Inter), 
+    sentinal = list(.x$Sentinal), 
+    nodes = .x$Nodes %>% list())
+  ) 
+trace1$source = input.gene.list
+
+trace2 = trace1 %>% unnest(nodes) %>% 
+  group_by(name, status) %>% 
+  summarise(min_path_length = min(min_path)) %>% 
+  mutate(in_bd = map_lgl(name, ~ .x %in% bd_genes))
+
 ##
 # Filter NW obj for traced nodes
-trace_filt <- unlist(trace) %>% unique()
+
+# trace_filt <- unlist(trace) %>% unique()
+trace_filt <- trace2$name
 
 trace.nw <- igraph::induced_subgraph(
   nw,
@@ -206,14 +296,16 @@ trace.nw <- igraph::induced_subgraph(
 
 ##
 # Annotate nodes that are queried or added by trace
-status = tibble( node = V(trace.nw) %>% names ) %>% 
-  mutate( node_status = if_else(node %in% input.gene.list, 'query', 'added') )
 
-igraph::vertex_attr(trace.nw, 'node_status', index = igraph::V(trace.nw)) <- status$node_status
+status = v_info(trace.nw) %>% select(name) %>% left_join(., trace2, by = 'name')
+  igraph::vertex_attr(trace.nw, 'node_inBD', index = igraph::V(trace.nw)) <- status$in_bd
+  igraph::vertex_attr(trace.nw, 'node_status', index = igraph::V(trace.nw)) <- status$status
+  igraph::vertex_attr(trace.nw, 'min_path_length', index = igraph::V(trace.nw)) <- status$min_path_length
 
 ##
 # save NW trace and filtered NW
-igraph::write_graph(
+
+  igraph::write_graph(
   trace.nw,
   paste0( full_path, '/',
           working_path, directionality, filt,
@@ -244,7 +336,7 @@ igraph::write_graph(
 #   )
 # )
 
-cat('\n','Trace complete and networks saved. \n')
+cat('\n','Trace complete and network saved. \n')
 Sys.time()
 
 # # generate plots ----------------------------------------------------------

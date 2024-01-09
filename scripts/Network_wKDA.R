@@ -122,14 +122,16 @@ cat('\n\nStarting wKDA...\n')
 Sys.time()
 
 # start a directory
-if( !(dir.exists( paste0(full_path,'/kda') )) ){
-  dir.create( paste0(full_path,'/kda') )
+kda_dir = 'kda_smallMod_test'
+if( !(dir.exists( paste0(full_path,'/', kda_dir) )) ){
+  dir.create( paste0(full_path,'/', kda_dir) )
 }
+
 
 # read traced, filtered NW objects
 trace.nw.bdFilt <- igraph::read_graph(
   paste0( full_path, '/',
-          'bdFiltered_',
+          # 'bdFiltered_',
           working_path, directionality, filt,
           '.graphml'),
   format = "graphml"
@@ -153,15 +155,15 @@ nw.simple <- igraph::simplify(
     evidence_pmid = 'concat',
     n_pathways = 'max',
     pathway_names = 'concat',
-    directed = 'max'
+    directed = 'max', 
+    dijkstra_dist = 'min'
   )
 )
 
 # Add TREAT-AD scores to edge attributes
 kda.nw <- tibble( ea = edge.attributes(nw.simple) ) %>% 
-  t() %>% as_tibble(rownames = NA, .name_repair = 'unique') %>% 
+  t() %>% as_tibble(rownames = NA, .name_repair = ~edge_attr_names(nw.simple)) %>% 
   unnest(everything()) %>% 
-  rename_with(., ~names(edge.attributes(nw.simple)), everything()) %>% 
   select(edge, interaction, occurrance, directed, n_edge, 
          n_edge_evidence, n_source, n_edge_types) %>% 
   mutate(HEAD = str_split_fixed(edge, ':',2)[,1], 
@@ -184,12 +186,16 @@ biodom %>%
   filter(!is.na(n_symbol),
          n_symbol > 0
          # , Biodomain == dom
+         # , subdomain_idx > 0
   ) %>% 
-  select(MODULE = GOterm_Name, NODE = symbol) %>% 
+  select(MODULE = GOterm_Name, NODE = symbol) %>%
+  # select(MODULE = Subdomain, NODE = symbol) %>% 
   unnest_longer(NODE) %>% 
   filter(NODE != '') %>% 
   distinct() %>% 
-  write_tsv(paste0(full_path, '/kda/', 'module_file.tsv'))
+  write_tsv(paste0(full_path, '/', kda_dir,'/', 'module_file.tsv'))
+  # write_tsv(paste0(full_path, '/kda_subdom_modules/', 'module_file.tsv'))
+
 
 ##
 # generate network file
@@ -198,32 +204,41 @@ kda.nw %>%
     across(.cols = c(starts_with('h.'), starts_with('t.')), 
            ~ if_else(is.na(.x), 0, .x)),
     WEIGHT = h.c+t.c
+    # WEIGHT = h.g+t.g
   ) %>%
   select(HEAD, TAIL, WEIGHT) %>% 
   distinct() %>% 
-  write_tsv(paste0(full_path, '/kda/', 
-                   working_path, directionality, filt , 
-                   '_network_file.tsv'))
+  write_tsv(paste0(full_path, 
+                   '/',kda_dir,'/',
+                   'network_file.tsv'))
 
 edgybois <- c(0,1)
 for(ef in edgyboi){
   
   ### Setup KDA job
   job.kda <- list()
-  # job.kda$label<-paste0(weight_type,'_',ef)  #filename
   job.kda$label<- paste0(working_path, directionality, filt, '_addWeights_edgeFactor_',ef)  #filename
-  job.kda$folder<- paste0(full_path)  #path  , '_depth2'
-  job.kda$netfile <- paste0(full_path, '/kda/', 
-                            working_path, directionality, filt,'_network_file.tsv')
-  job.kda$modfile <- paste0(full_path, '/kda/', 'module_file.tsv')
+  job.kda$folder<- paste0(full_path,'/',kda_dir)  #path  , '_depth2'
+  job.kda$netfile <- paste0(full_path, '/',
+                            kda_dir, '/', 
+                            'network_file.tsv') 
+  job.kda$modfile <- paste0(full_path,'/',
+                            kda_dir, '/', 
+                            'module_file.tsv')
   job.kda$edgefactor<- ef  #edgybois
-  job.kda$depth<- 1
+  job.kda$depth <- 1
   if(directed) {job.kda$direction <- 1} else {job.kda$direction <- 0}
-  job.kda$nperm <- 100000  #100000  
+  job.kda$nperm <- 20000  #100000  
+  job.kda$minsize <- 5
+  
   moddata <- tool.read(job.kda$modfile)
   ## save this to a temporary file and set its path as new job.kda$modfile:
-  tool.save(moddata, "subsetof.supersets.txt")
-  job.kda$modfile <- "subsetof.supersets.txt"
+  tool.save(moddata, paste0(full_path, '/',
+                            kda_dir, '/', 
+                            "subsetof.supersets.txt"))
+  job.kda$modfile <- paste0(full_path, '/',
+                            kda_dir, '/', 
+                            "subsetof.supersets.txt")
   
   ## Running KDA
   job.kda <- kda.configure(job.kda)
@@ -233,6 +248,17 @@ for(ef in edgyboi){
   job.kda <- kda.finish(job.kda)
   
 }
+
+# move files from kda dir to 
+f = list.files(paste0(full_path, '/',kda_dir, '/kda'), full.names = T)
+for(i in f){
+  file.rename(
+    from = i,
+    to = paste0(full_path, '/',kda_dir, '/', basename(i))
+  )
+}
+unlink(paste0(full_path, '/',kda_dir, '/kda'), recursive = T)
+
 
 cat('\n\nwKDA complete. \n')
 Sys.time()

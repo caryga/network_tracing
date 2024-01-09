@@ -11,24 +11,40 @@ working="/projects/carter-lab/caryg/network_tracing"
 
 cd $working
 
-## exampl slurm batch job call:
+###
+# example slurm batch job call:
+###
+
 #for i in results/biodomain/*/queryList*; do sbatch scripts/batch_trace.sbatch $i dir node edge; done
 
-## wait for trace to complete
-trace_jobid=`sbatch --job-name=pathtrace -o ./logs/trace-%j.log --time=72:00:00 --cpus-per-task=12 --mem=16GB ./scripts/pathtrace.sbatch $1 $2 $3 $4 | grep -o "[0-9]*"`
-echo trace_jobid
+###
+# wait for trace to complete:
+###
 
-kda_jobid_ef1=`sbatch --job-name=kda -o ./logs/kda-%j.log --dependency=afterok:$trace_jobid --qos=long --time=14-00:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef1`
-echo kda_jobid_ef1
-
-kda_jobid_ef2=`sbatch --job-name=kda -o ./logs/kda-%j.log --dependency=afterok:$trace_jobid --qos=long --time=14-00:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef0`
-echo kda_jobid_ef2
-
-## don't wait, just run kda:
-# kda_jobid_ef1=`sbatch --job-name=kda -o ./logs/kda-%j.log --qos=long --time=14-00:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef1`
+# trace_jobid=`sbatch --job-name=pathtrace -o ./logs/trace-%j.log --time=72:00:00 --cpus-per-task=12 --mem=16GB ./scripts/pathtrace.sbatch $1 $2 $3 $4 | grep -o "[0-9]*"`
+# echo trace_jobid
+# 
+# kda_jobid_ef1=`sbatch --job-name=kda -o ./logs/kda-%j.log --dependency=afterok:$trace_jobid --qos=long --time=14-00:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef1`
 # echo kda_jobid_ef1
 # 
-# kda_jobid_ef0=`sbatch --job-name=kda -o ./logs/kda-%j.log --qos=long --time=14-00:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef0`
-# echo kda_jobid_ef0
+# kda_jobid_ef2=`sbatch --job-name=kda -o ./logs/kda-%j.log --dependency=afterok:$trace_jobid --qos=long --time=14-00:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef0`
+# echo kda_jobid_ef2
+
+###
+# don't wait, just run kda:  --qos=long --time=14-00:00:00
+###
+
+kda_jobid_ef1=`sbatch --job-name=kda -o ./logs/kda-%j.log --time=24:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef1`
+echo kda_jobid_ef1
+
+kda_jobid_ef0=`sbatch --job-name=kda -o ./logs/kda-%j.log --time=24:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4 ef0`
+echo kda_jobid_ef0
+
+###
+# synapse upload
+###
+
+# synapse_upload_jobid=`sbatch --job-name=synapse_upload -o ./logs/synUpload-%j.log --dependency=afterok:$kda_jobid_ef1 --dependency=afterok:$kda_jobid_ef2 --time=1:00:00 --cpus-per-task=1 --mem=4GB ./scripts/kda.sbatch $1 $2 $3 $4`
+# echo synapse_upload_jobid
 
 exit

@@ -26,6 +26,9 @@ biodom <- full_join(
 
 domains <- biodom %>% pull(Biodomain) %>% unique() %>% sort() %>% .[!is.na(.)]
 
+subdomains <- biodom %>% select(Biodomain, subdomain_idx, Subdomain) %>% 
+  distinct() %>% filter(subdomain_idx != 0)
+
 # # enriched biodomain terms
 # trs.enr <- read_csv(synGet('syn45824995')$path, col_types = cols()) %>% 
 #   mutate(leadingEdge_genes = str_split(leadingEdge_genes, '\\|'))

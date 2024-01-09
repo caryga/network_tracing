@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 ### SLURM HEADER
 ##SBATCH --output=/projects/carter-lab/caryg/network_tracing/logs/batchtrace-%j.log  #!!
-#SBATCH --mail-type=END,FAIL
+##SBATCH --mail-type=END,FAIL
+#SBATCH --mail-type=FAIL
 #SBATCH --mail-user=greg.cary@jax.org #!!
 #SBATCH --qos=batch
 ##SBATCH --time=96:00:00

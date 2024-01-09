@@ -1,0 +1,546 @@
+---
+title: "Tune Graph Reconstruction with CRISPR Brain data"
+author: "Greg Cary"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    fig_width: 5
+    fig_height: 4
+  html_notebook:
+    code_folding: hide
+    theme: readable
+    # css: style.css
+    toc: true
+    toc_float: true
+---
+
+The Biodomain knowledge graph reconstruction process involves a variety of choices, such as what edge weights to use for Dijkstra's algorithm. One way to assess the quality and utility of the graphs returned is to align with experimental data.
+
+The [CRISPRbrain](http://crisprbrain.org){target="_blank"} resource hosts the results from several genome-wide CRISPR screens for various phenotypes in disease-relevant cell types (e.g. Neurons, Astrocytes, Microglia).
+
+The goal of this work is to use the hits from relevant CRISPRbrain screens that are identified as drivers within the most appropriate Biodomain graph. For example, what graph reconstruction parameters produce
+
+First, setup the environment
+
+# setup
+
+## packages
+
+```{r}
+library(synapser)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(tidyverse)
+
+source(here::here('..','treatAD_biodomains','scripts',
+                  'biodom_tally.R'))
+source(here::here('..','treatAD_biodomains','scripts',
+                  'annotate_enr_term_biodomains.R'))
+
+theme_set(theme_bw())
+```
+
+## functions
+
+Read the directories from Synapse into a data frame
+
+```{r}
+read_syn_dir <- function(parent_id){
+  synapser::synGetChildren(parent_id)$asList() %>%
+    tibble(f = .) %>% unnest_wider(f)
+}
+```
+
+Extract and condense graph data
+
+```{r}
+v_info <- function(net){
+  v.attr <- tibble( na = vertex.attributes(net) ) %>% t() %>% 
+    as_tibble(rownames = NA, .name_repair = ~vertex_attr_names(net) ) %>% 
+    unnest(everything()) 
+}
+
+e_info <- function(net){
+  e.attr <- tibble( ea = edge.attributes(net) ) %>% t() %>% 
+    as_tibble(rownames = NA, .name_repair = ~edge_attr_names(net) ) %>% 
+    unnest(everything()) 
+}
+
+simp <- list(interaction = 'concat',
+              edge = 'random',
+              occurrance = 'concat',
+              n_edge = 'max',
+              n_edge_types = 'max',
+              n_edge_evidence = 'max',
+              n_source = 'max',
+              sources = 'concat',
+              n_evidence = 'sum',
+              evidence_pmid = 'concat',
+              n_pathways = 'max',
+              pathway_names = 'concat',
+              directed = 'max',
+              dijkstra_dist = 'min')
+```
+
+Read the KDA results directory (remote or local)
+
+```{r}
+read_kd <- function(path){
+  
+  # detect if KDA dir path is on synapse
+  if(substr(path,1,3) == 'syn'){
+        
+    synDir <- synGetChildren(path)$asList() %>%
+      tibble(f = .) %>% unnest_wider(f)
+    
+    kd.ef0 <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_0.results.txt', name) ) %>% pull(id)
+        )$path, 
+        col_types = cols())
+    ef0.top <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_0.tophits.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+    
+    kd.ef1 <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_1.results.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols())
+    ef1.top <- read_tsv(
+      synGet( 
+        synDir %>% filter( grepl('edgeFactor_1.tophits.txt', name) ) %>% pull(id)
+        )$path, 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+  
+  # or read from a local path
+  } else {
+    
+    kd.pth <- list.files(path, full.names = T)
+    
+    if(length(kd.pth) < 13){
+      warning('Not full kda result set')
+      return( kd = tibble(NULL))
+    }
+  
+    kd.ef0 <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_0.results.txt'), 
+      col_types = cols())
+    ef0.top <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.tophits.txt'), 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+    kd.ef1 <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.results.txt'),  
+      col_types = cols())
+    ef1.top <- read_tsv(
+      kd.pth %>% str_subset('edgeFactor_1.tophits.txt'), 
+      col_types = cols()) %>% 
+      mutate(kd = paste0(NODE,'-',MODULE))
+  }
+    
+  # Join up the results
+  kd = bind_rows(
+    kd.ef0 %>% mutate(ef = 'ef0_fdr'),
+    kd.ef1 %>% mutate(ef = 'ef1_fdr')
+    ) %>% 
+    mutate(FDR = -log10(FDR)) %>%
+    pivot_wider(
+      id_cols = c(MODULE, NODE, MEMBER), 
+      names_from = ef, 
+      values_from = FDR, 
+      values_fill = 0) %>%
+    mutate(delta_fdr = ef1_fdr - ef0_fdr) %>% 
+    arrange(desc(delta_fdr)) %>% 
+    rowwise() %>% 
+    mutate(top_ef0 = 0,top_ef1 = 0)
+  
+  # Indicate which driver-module pairs are top for each analysis
+  if( any( ef1.top$FDR < 0.05 ) ){
+    kd$top_ef1[ which(paste0(kd$NODE,'-',kd$MODULE) %in%
+                        ef1.top$kd[ef1.top$FDR < 0.05]) ] <- 1
+  }
+  if( any( ef0.top$FDR < 0.05 ) ){
+    kd$top_ef0[ which(paste0(kd$NODE,'-',kd$MODULE) %in%
+                        ef0.top$kd[ef0.top$FDR < 0.05]) ] <- 1
+  }
+  
+  kd <- kd %>% rowwise() %>% 
+    mutate(top_kd = case_when(
+      (top_ef1 == 1 & top_ef0 == 1)~'both',
+      (top_ef1 == 1 & top_ef0 == 0)~'ef1',
+      (top_ef1 == 0 & top_ef0 == 1)~'ef0',
+      (top_ef1 == 0 & top_ef0 == 0)~'neither'
+      )) 
+  
+  return(kd)
+}
+```
+
+Annotate KD results with graph and Biodomain details
+
+```{r}
+integrate_kd <- function(path) {
+  
+  nodes <- list.files(dirname(path), full.names = T) %>%
+    str_subset('graphml') %>%
+    str_subset('bdFiltered', negate = T) %>%
+    read_graph(format = 'graphml') %>%
+    v_info() %>%
+    mutate(n_nodes = nrow(.))
+  
+  nw_terms <- biodom %>%
+    group_by(GOterm_Name, symbol, n_symbol) %>%
+    summarise(n_nw = length(intersect(symbol, nodes$name)), .groups = 'keep') %>%
+    mutate(pct_term = 100 * (n_nw / n_symbol)) %>%
+    distinct() %>% 
+    ungroup()
+  
+  kd.res <- read_kd(path)
+  
+  if (nrow(kd.res) == 0) {
+    kd.res = tibble(NODE = NA_character_, MODULE = NA_character_)
+  }
+  
+  kd.res <- kd.res %>%
+    left_join(., nodes %>% select(NODE = name
+                                  , n_nodes
+                                  , node_status
+                                  # , node_inBD
+                                  # , min_path_length
+                                  )
+              , by = 'NODE') %>%
+    left_join(.,
+              biodom %>% 
+                select(MODULE = GOterm_Name
+                       , Biodomain:TopSD
+                       , abbr:color)
+              ,by = 'MODULE') %>%
+    left_join(.,
+              nw_terms %>% 
+                select(MODULE = GOterm_Name
+                       , n_symbol:pct_term) %>% distinct()
+              ,by = 'MODULE') %>%
+    mutate(nw = basename(dirname(path))) %>%
+    mutate(pct_nodes = (n_nw / n_nodes) * 100) %>%
+    select(
+      nw
+      , n_nodes
+      , contains('_fdr')
+      , NODE
+      , node_status
+      # , node_inBD
+      # , min_path_length
+      , contains('top_')
+      , contains('MEMBER')
+      , MODULE
+      , Biodomain
+      , Subdomain
+      , subdomain_idx
+      , TopSD
+      , pct_nodes
+      , pct_term
+      , n_nw
+      , n_symbol
+      , abbr
+      , label
+      , color
+    )
+  }
+```
+
+Plot CRISPRbrain phenotypes and cells per gene
+
+```{r}
+cbrain_pheno_plot_by_gene = function( table ){
+  theme_set(theme_bw())
+  if( nrow(table)==0 ) {return(NULL)}
+  ggplot(table, aes(Gene,phenotype)) + 
+    facet_grid(str_replace_all(cell,' ','\n')~str_remove_all(mode, 'CRISPR'), 
+               scales = 'free', space = 'free')+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          legend.position = 'top', legend.box = 'vertical', 
+          legend.spacing = unit(.001,units = 'pt'),
+          strip.text.y = element_text(angle = 0) )+
+    geom_point( alpha = .7, 
+                aes(fill = gene_score, size = -log10(pval), shape = `Hit Class`))+
+    scale_size_continuous(guide = 'none')+ 
+    scale_x_discrete(limits = rev)+ 
+    scale_shape_manual(values = c(24,25), #22
+                       breaks = c('Positive Hit','Negative Hit') )+ #'Non-Hit',
+    guides(size = guide_legend( override.aes=list(pch = 22))) +
+    scale_fill_gradient2(low = 'purple', mid = 'white', high = 'green', midpoint = 0)+
+    labs(x = 'Perturbagen', y = 'Screen Phenotype')
+}
+```
+
+Plot subnetwork around identified KDs
+
+```{r}
+plot_kd_subnet <- function(nw, kdn, term, tkd = 'unknown') {
+  
+  vert_num <- match(kdn, V(nw)$name)
+  
+  vert_neigh <- neighbors(nw, vert_num)
+  
+  term_num <- biodom %>%
+    filter(GOterm_Name == term) %>%
+    pull(symbol) %>% unlist() %>%
+    match(., V(nw)$name) %>% .[!is.na(.)]
+  
+  g3 <- induced_subgraph(nw, c(vert_num, term_num))
+  unlinked <- names(degree(g3)[which(degree(g3)==0)])
+  g3 <- delete.vertices(g3, unlinked)
+  
+  ggraph(g3, layout = 'graphopt') +
+    geom_edge_link(alpha = .2, color = 'grey75') +
+    geom_edge_link(alpha = .8, color = 'grey25', aes(filter = grepl(kdn, .E()$edge))) +
+    geom_node_point( shape = 21, color = "grey70", alpha = 1,
+                     aes(size = TargetRiskScore, fill = Pro_EffectScore, 
+                         filter= .N()$name != kdn)  )+
+    geom_node_point( shape = 23, color = "grey70", alpha = 1,
+                     aes(size = TargetRiskScore, fill = Pro_EffectScore, 
+                         filter = .N()$name == kdn), show.legend = F )+
+    geom_node_point( shape = 9, color = "firebrick1", alpha = 1,
+                       aes(size = TargetRiskScore, fill = Pro_EffectScore, 
+                           filter = .N()$name == kdn), show.legend = F )+
+    geom_node_text(aes(label = name), size = 4, nudge_x = 5, nudge_y =-5) +
+    scale_size_continuous( range = c(0, 7), limits = c(0, 5), trans = 'exp')+ #, trans = 'exp'
+    scale_fill_gradient2(
+        low = 'purple', mid = 'grey80', high = 'green', na.value = 'grey85',
+        limits = c(-2.5,2.5) )+ #approx: range(omics$Pro_TE, na.rm = T)
+    labs( subtitle = paste0('KD: ', kdn, 
+                            '\nTerm: ', term,
+                            '\nKD in term?: ', vert_num %in% term_num,
+                            '\nTop KD?: ', tkd) )+
+    theme_graph(background = 'white')
+}
+```
+
+## TREAT-AD data
+
+Grab relevant data from synapse, including:
+
+1)  Target Risk Scores ([syn25575156](https://www.synapse.org/#!Synapse:syn25575156){target="_blank"}), Omics Scores ([syn22758536](https://www.synapse.org/#!Synapse:syn22758536){target="_blank"}), Neuropath Scores ([syn32288310](https://www.synapse.org/#!Synapse:syn32288310){target="_blank"}), and Agora target nominations ([syn12540368](https://www.synapse.org/#!Synapse:syn12540368){target="_blank"})
+
+2)  Biodomain Definitions ([syn25428992](https://www.synapse.org/#!Synapse:syn25428992){target="_blank"})
+
+3)  Risk-enriched Biodomain Terms ([syn45824995](https://www.synapse.org/#!Synapse:syn45824995){target="_blank"})
+
+4)  Base graph ([syn51110930](https://www.synapse.org/#!Synapse:syn51110930){target="_blank"}) and node and edge filtered graph
+
+```{r}
+synLogin()
+
+# target risk scores
+scores <- read_csv(
+  synTableQuery('select * from syn25575156', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+omics <- read_csv(
+  synTableQuery('select * from syn22758536', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+npath <- read_csv(
+  synTableQuery('select * from syn32288310', includeRowIdAndRowVersion = F)$filepath
+  , col_types = cols())
+
+agora <- read_csv(synGet('syn12540368')$path, quote = '"', col_types = cols())
+
+# biological domain annotations
+biodom <- full_join(
+  # biodomains
+  readRDS(synGet('syn25428992')$path),
+  # domain labels
+  read_csv(synGet('syn26856828')$path, col_types = cols()),
+  by = c('Biodomain'='domain')
+) %>%
+  mutate(Biodomain = case_when(Biodomain == 'none' ~ NA_character_, T ~ Biodomain))
+
+domains = biodom %>% pull(Biodomain) %>% unique() %>% sort()
+
+# enriched biodomain terms
+enr.bd <- synGet('syn52749187') %>% .$path %>% readRDS() %>% 
+  filter(score == 'Overall') %>% select(anno) %>% unnest(anno) %>% 
+  mutate(leadingEdge_genes = str_split(core_enrichment, '\\|'))
+
+# base network
+base_net <- igraph::read_graph(synGet('syn51110930')$path, format = 'graphml') 
+
+# filt node & edge
+tmp <- igraph::delete_vertices(
+  base_net,
+  igraph::V(base_net)[ igraph::V(base_net)$brain_exp == 0 ]
+)
+undir_node_edge <- igraph::subgraph.edges(
+  tmp,
+  igraph::E(tmp)[ igraph::E(tmp)$n_edge_evidence > 1 ],
+  delete.vertices = T 
+)
+
+# specify directed edge types
+directed_edge_types = c("catalysis-precedes",
+                        "controls-expression-of",
+                        "controls-phosphorylation-of",
+                        "controls-state-change-of",
+                        "controls-transport-of"
+                        )
+```
+
+## CRISPRbrain data
+
+Read data obtained from CRISPRbrain API and summarize hits per assay/experiment
+
+```{r}
+synLogin()
+
+# CRISPRbrain data
+syn.dir <- read_syn_dir('syn51183357')
+
+# Simple Screens
+simple <- suppressWarnings( # suppress tidyr warnings about column renaming
+  map_dfr(
+    syn.dir %>% with(which( !grepl('RNA|CROP',name) )),
+    ~ { 
+      id = syn.dir$id[.x]
+      n = syn.dir$name[.x]
+      synGet(id)$path %>% 
+        read_csv( col_types = cols() )  %>% 
+        mutate(cell = n %>% str_split_fixed(.,'-(?!M)', 2) %>% .[,1],
+               mode = n %>% str_extract('CRISPR[ain]'),
+               expt = n %>% str_remove_all('-CRISPR[ain].csv') %>% 
+                 str_split_fixed('-(?!M)',2) %>% .[,2] ) %>% 
+        relocate(cell, mode, expt)
+    }
+  ) %>% 
+  rename(pval = `P Value`, pheno = `Phenotype`, gene_score = `Gene Score`)
+)
+
+# Add extended phenotype descriptor
+simple <- tibble(expt = simple$expt %>% unique() %>% sort(),
+                 phenotype = c(
+                   'Expansion (CD34 Staining)',
+                   'Reactive Oxygen Species (CellRox Intensity)',
+                   'Proliferation (CFSE Staining)',
+                   'Survival (14 day)', 'Survival (21 day)', 'Survival (28 day)',
+                   'Labile Iron (FeRhoNox Intensity)',
+                   'Immune Activation (CD38 levels)',
+                   'Lysosome Exocytosis (cell surface LAMP1), +IL1a +TNF +C1q',
+                   'Lysosome Exocytosis (cell surface LAMP1), Vehicle',
+                   'Peroxidized Lipids (Liperfluo intensity)',
+                   'Lysosome (LysoTracker intensity)',
+                   'Lysosome Mass or pH (LysoTracker staining), +IL1a +TNF +C1q',
+                   'Lysosome Mass or pH (LysoTracker staining), Vehicle',
+                   'Survival, no antioxidants',
+                   'Phagocytosis (pHRodo-rat synaptosomes)',
+                   'Phagocytosis (pHRodo-labeled synaptosomes), +IL1a +TNF +C1q',
+                   'Phagocytosis (pHRodo-labeled synaptosomes), Vehicle',
+                   'Survival, PSAP KO & no antioxidants',
+                   'Survival, PSAP KO',
+                   'Survival',
+                   'Survival-Proliferation',
+                   'Inflammatory activation (cell-surface VCAM1 levels), +IL1a +TNF+C1q')
+                 ) %>% left_join(simple, . , by = 'expt')
+
+
+```
+
+## graph & KDA directory structure
+
+For this work I want to consider KDA results from several different runs. So first of all, specify the local data directories.
+
+```{r}
+results_dir <- here::here('results')
+
+kd_paths <- tibble(
+  dir = c(
+    'biodomain',
+    'biodomain_dijkstra',
+    'subdomain',
+    'subdomain_dijkstra' ),
+  kd = list(
+    c('kda_genetics', 'kda_smallMod_test', 'kda_subdom_modules'),
+    #'kda',
+    c('kda_', 'kda_full_add', 'kda_full_mult', 'kda_smallMod_test'),
+    c('kda'),
+    c('kda_full_add', 'kda_full_mult', 'kda_smallMod_test') )
+  ) %>%  
+  mutate(nw_dirs = map(
+    dir,
+    ~ if (grepl('sub', .x)) {
+      list.dirs(here::here(results_dir, .x), recursive = F) %>% 
+        list.dirs(recursive = F)
+      } else {
+        list.dirs(here::here(results_dir, .x), recursive = F)
+        })) %>%
+  relocate(kd, .after = nw_dirs) %>%
+  unnest(kd)
+```
+
+# CRISPRbrain phenotypes to align
+
+The CRISPRbrain data contains several datasets from different experiments. Here are the distributions of assay hits for each combination.
+
+```{r fig.width=12, fig.height=5}
+simple %>% 
+  filter(`Hit Class` != 'Non-Hit',
+         cell %in% c("Glutamatergic Neuron","iAstrocyte","iTF-Microglia" )
+         ) %>% 
+  group_by(cell, mode, expt) %>% 
+  summarise(n_hit = length(unique(Gene))) %>% 
+  mutate(expt = fct_reorder(expt,n_hit)) %>% 
+  arrange(expt) %>% 
+  ggplot(aes(n_hit,expt)) +
+  labs(x = '# Unique Gene Hits', y = '')+
+  geom_bar(stat = 'identity',
+           color = 'black',
+           fill = 'grey80',
+           width = .7)+
+  facet_grid(mode~cell, scales = 'free', space = 'free' )
+```
+
+We don't expect that KDA will be able to distinguish between directionality (i.e. CRISPRi vs CRISPRa hits should be equivalent) or cell type. Therefore, we'd like to integrate and find all of the genes that when perturbed in neurons, astrocytes, ***or*** microglia produce a relevant phenotype. Define a common phenotype label to group related phenotypes.
+
+```{r}
+# Group related phenotypes
+simple1 <- simple %>% 
+  filter(
+    # !grepl('Antioxidants-Survival|^Survival|KO-Survival',expt),
+    cell %in% c("Glutamatergic Neuron","iAstrocyte","iTF-Microglia" )
+  ) %>% 
+  mutate(
+    pheno2 = case_when(
+      grepl('rolif|xpansion',phenotype) ~ 'proliferation',
+      grepl('urvival', phenotype) ~ 'survival',
+      grepl('hagocytosis',phenotype) ~ 'phagocytosis',
+      grepl('LysoTracker',phenotype) ~ 'lysotracker',
+      grepl('ysosome',phenotype) ~ 'lysosome_exocytosis',
+      grepl('ctivation',phenotype) ~ 'inflammation',
+      grepl('CellRox|Liperfluo',phenotype) ~ 'ROS',
+      grepl('FeRhoNox',phenotype) ~ 'labile Fe',
+      # grepl('Liperfluo',phenotype) ~ 'LiperFluo'
+    )
+  )
+```
+
+```{r fig.width=12, fig.height=5}
+simple1 %>% 
+  filter(`Hit Class` != 'Non-Hit',
+         !grepl('Antioxidants-Survival|^Survival$|KO-Survival',expt),
+         cell %in% c("Glutamatergic Neuron","iAstrocyte","iTF-Microglia" )
+         ) %>% 
+  group_by(cell,  pheno2) %>% 
+  summarise(n_hit = length(unique(Gene))) %>% 
+  mutate(pheno2 = fct_reorder(pheno2,n_hit)) %>% 
+  arrange(pheno2) %>% 
+  ggplot(aes(n_hit,pheno2)) +
+  labs(x = '# Unique Gene Hits', y = '')+
+  geom_bar(stat = 'identity',
+           color = 'black',
+           fill = 'grey80',
+           width = .7)+
+  facet_grid(~cell, scales = 'free', space = 'free' )
+```

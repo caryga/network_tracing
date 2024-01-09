@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 ### SLURM HEADER
 ##SBATCH --output=/projects/carter-lab/caryg/network_tracing/logs/batchtrace-%j.log  #!!
-#SBATCH --mail-type=END,FAIL
+## SBATCH --mail-type=END,FAIL
+#SBATCH --mail-type=FAIL
 #SBATCH --mail-user=greg.cary@jax.org #!!
 ##SBATCH --qos=batch
 ##SBATCH --qos=long
@@ -24,13 +25,12 @@ cd $working
 module load singularity
 
 ## exampl slurm batch job call:
-#for i in results/biodomain/*/queryList*; do sbatch scripts/batch_trace.sbatch $i dir node edge; done
+#for i in results/biodomain/*/queryList*; do sbatch scripts/batch_trace.sbatch $i dir node edge ef0; done
 
 # Biodomain NWs
 singularity exec $simg_path Rscript $working/scripts/Network_wKDA.R $1 $2 $3 $4 $5
 
 # # Pseudotime NWs
 # singularity exec $simg_path Rscript $working/scripts/pseudotime_nw_wKDA.R $1 $2 $3 $4 $5
-
 
 exit

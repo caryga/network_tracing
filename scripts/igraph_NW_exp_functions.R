@@ -464,7 +464,24 @@ short_paths <- function( tnet, target, targets, sentinals, edge_weights = NULL, 
     weights = omics_scores,
     cores = cores
   )
-  return(list( Inter = t_vertices, Sentinal=s_vertices))
+  
+  ## report min path length
+  path_tibble = tibble(x = c(paths$res, sent_paths$res)) %>% 
+    mutate(
+      path = map_chr(x, ~.x %>% names %>% paste(collapse = ' > ')), 
+      length = map_dbl(x, ~ length(.x))
+      ) %>% 
+    select(path, length) %>% 
+    distinct()
+  
+  nodes = tibble(name = union(t_vertices,s_vertices)) %>% 
+    mutate( 
+      status = if_else(name %in% union(targets,sentinals), 'input', 'added'),
+      min_path = map_dbl(name, ~ path_tibble %>% filter(grepl(.x,path)) %>% 
+                           pull(length) %>% min())
+      )
+  
+  return(list( Inter = t_vertices, Sentinal=s_vertices, Nodes = nodes ))
 }
 #' Wraps the Short Paths Trace Function  
 #' 
